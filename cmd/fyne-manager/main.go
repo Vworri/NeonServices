@@ -38,6 +38,7 @@ type ManagerApp struct {
 	currentUser     *database.User
 	userStatusLabel *widget.Label
 	loginBtn        *widget.Button
+	registerBtn     *widget.Button
 	logoutBtn       *widget.Button
 
 	// SSH Connection inputs
@@ -110,6 +111,9 @@ func (m *ManagerApp) buildUI() fyne.CanvasObject {
 	m.loginBtn = widget.NewButtonWithIcon("Log In", theme.LoginIcon(), func() {
 		m.showLoginDialog()
 	})
+	m.registerBtn = widget.NewButtonWithIcon("Register", theme.ContentAddIcon(), func() {
+		m.showRegisterDialog()
+	})
 	m.logoutBtn = widget.NewButtonWithIcon("Log Out", theme.LogoutIcon(), func() {
 		m.logout()
 	})
@@ -122,7 +126,7 @@ func (m *ManagerApp) buildUI() fyne.CanvasObject {
 	topBar := container.NewBorder(
 		nil, nil,
 		container.NewHBox(brandText, widget.NewLabel(" | Enterprise NAS & Device Hub")),
-		container.NewHBox(m.userStatusLabel, m.loginBtn, m.logoutBtn),
+		container.NewHBox(m.userStatusLabel, m.loginBtn, m.registerBtn, m.logoutBtn),
 	)
 
 	m.tabs = container.NewAppTabs(
@@ -149,6 +153,7 @@ func (m *ManagerApp) buildUI() fyne.CanvasObject {
 
 func (m *ManagerApp) showLoginDialog() {
 	userEntry := widget.NewEntry()
+	userEntry.SetText("admin")
 	userEntry.SetPlaceHolder("admin or your username")
 	passEntry := widget.NewPasswordEntry()
 	passEntry.SetPlaceHolder("password")
@@ -203,6 +208,7 @@ func (m *ManagerApp) showLoginDialog() {
 
 			m.userStatusLabel.SetText(fmt.Sprintf("Logged in: %s (%s)", m.currentUser.Username, strings.ToUpper(string(m.currentUser.Role))))
 			m.loginBtn.Hide()
+			m.registerBtn.Hide()
 			m.logoutBtn.Show()
 
 			// Refresh all user tabs
@@ -218,11 +224,83 @@ func (m *ManagerApp) showLoginDialog() {
 	}, m.window)
 }
 
+func (m *ManagerApp) showRegisterDialog() {
+	userEntry := widget.NewEntry()
+	userEntry.SetPlaceHolder("username")
+	emailEntry := widget.NewEntry()
+	emailEntry.SetPlaceHolder("user@neonservices.local")
+	passEntry := widget.NewPasswordEntry()
+	passEntry.SetPlaceHolder("at least 8 characters")
+	urlEntry := widget.NewEntry()
+	urlEntry.SetText(m.apiBaseURL)
+
+	items := []*widget.FormItem{
+		widget.NewFormItem("Server API URL", urlEntry),
+		widget.NewFormItem("Username", userEntry),
+		widget.NewFormItem("Email", emailEntry),
+		widget.NewFormItem("Password", passEntry),
+	}
+
+	dialog.ShowForm("Register Account", "Register", "Cancel", items, func(confirmed bool) {
+		if !confirmed || userEntry.Text == "" || passEntry.Text == "" {
+			return
+		}
+		m.apiBaseURL = strings.TrimRight(urlEntry.Text, "/")
+
+		go func() {
+			payload := map[string]string{
+				"username": userEntry.Text,
+				"email":    emailEntry.Text,
+				"password": passEntry.Text,
+			}
+			bodyBytes, _ := json.Marshal(payload)
+			resp, err := m.httpClient.Post(m.apiBaseURL+"/api/v1/auth/register", "application/json", bytes.NewReader(bodyBytes))
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("Failed to connect to %s: %v", m.apiBaseURL, err), m.window)
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusCreated {
+				data, _ := io.ReadAll(resp.Body)
+				dialog.ShowError(fmt.Errorf("Registration failed: %s", string(data)), m.window)
+				return
+			}
+
+			var authRes struct {
+				Success bool `json:"success"`
+				Data    struct {
+					Token string         `json:"token"`
+					User  *database.User `json:"user"`
+				} `json:"data"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&authRes); err == nil && authRes.Data.User != nil {
+				m.authToken = authRes.Data.Token
+				m.currentUser = authRes.Data.User
+
+				m.userStatusLabel.SetText(fmt.Sprintf("Logged in: %s (%s)", m.currentUser.Username, strings.ToUpper(string(m.currentUser.Role))))
+				m.loginBtn.Hide()
+				m.registerBtn.Hide()
+				m.logoutBtn.Show()
+
+				m.refreshProfileView()
+				m.refreshDeviceList()
+				m.refreshUserFiles()
+				if m.currentUser.Role == database.RoleAdmin {
+					m.refreshUsersList()
+				}
+				dialog.ShowInformation("Welcome", fmt.Sprintf("Account created successfully for %s!", m.currentUser.Username), m.window)
+			}
+		}()
+	}, m.window)
+}
+
 func (m *ManagerApp) logout() {
 	m.authToken = ""
 	m.currentUser = nil
 	m.userStatusLabel.SetText("Status: Logged Out (Public Guest)")
 	m.loginBtn.Show()
+	m.registerBtn.Show()
 	m.logoutBtn.Hide()
 	m.profileInfoLabel.SetText("Please log in to view your profile and credentials.")
 	m.apiKeyEntry.SetText("")
