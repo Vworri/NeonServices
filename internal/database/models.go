@@ -42,6 +42,9 @@ type DisplayConfig struct {
 	CalendarURL           string    `json:"calendar_url"`
 	FullRefreshMinutes    int       `json:"full_refresh_minutes"`
 	PartialRefreshMinutes int       `json:"partial_refresh_minutes"`
+	BLEMAC                string    `json:"ble_mac"`
+	AutoPush              bool      `json:"auto_push"`
+	PushIntervalSeconds   int       `json:"push_interval_seconds"`
 	CreatedAt             time.Time `json:"created_at"`
 	UpdatedAt             time.Time `json:"updated_at"`
 }

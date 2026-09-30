@@ -55,6 +55,9 @@ type ConfigRequest struct {
 	CalendarURL           string  `json:"calendar_url"`
 	FullRefreshMinutes    int     `json:"full_refresh_minutes"`
 	PartialRefreshMinutes int     `json:"partial_refresh_minutes"`
+	BLEMAC                string  `json:"ble_mac"`
+	AutoPush              bool    `json:"auto_push"`
+	PushIntervalSeconds   int     `json:"push_interval_seconds"`
 }
 
 func DefaultConfig(deviceID string, userID int64) *database.DisplayConfig {
@@ -68,5 +71,8 @@ func DefaultConfig(deviceID string, userID int64) *database.DisplayConfig {
 		CalendarURL:           "",
 		FullRefreshMinutes:    30,
 		PartialRefreshMinutes: 1,
+		BLEMAC:                "AC:27:6E:A6:AA:F5",
+		AutoPush:              false,
+		PushIntervalSeconds:   60,
 	}
 }

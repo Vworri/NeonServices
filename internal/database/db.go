@@ -95,6 +95,9 @@ func (db *DB) migrate() error {
 		calendar_url TEXT NOT NULL DEFAULT '',
 		full_refresh_minutes INTEGER NOT NULL DEFAULT 30,
 		partial_refresh_minutes INTEGER NOT NULL DEFAULT 1,
+		ble_mac TEXT NOT NULL DEFAULT '',
+		auto_push INTEGER NOT NULL DEFAULT 0,
+		push_interval_seconds INTEGER NOT NULL DEFAULT 60,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
@@ -115,6 +118,9 @@ func (db *DB) migrate() error {
 
 	// Safe alter table for existing databases created before api_key column
 	_, _ = db.conn.Exec("ALTER TABLE users ADD COLUMN api_key TEXT;")
+	_, _ = db.conn.Exec("ALTER TABLE display_configs ADD COLUMN ble_mac TEXT NOT NULL DEFAULT '';")
+	_, _ = db.conn.Exec("ALTER TABLE display_configs ADD COLUMN auto_push INTEGER NOT NULL DEFAULT 0;")
+	_, _ = db.conn.Exec("ALTER TABLE display_configs ADD COLUMN push_interval_seconds INTEGER NOT NULL DEFAULT 60;")
 	_, _ = db.conn.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key);")
 
 	// Backfill any users without an API key
@@ -341,9 +347,16 @@ func (db *DB) LogAudit(log *AuditLog) error {
 // Display and Calendar database methods
 
 func (db *DB) SaveDisplayConfig(cfg *DisplayConfig) error {
+	autoPushInt := 0
+	if cfg.AutoPush {
+		autoPushInt = 1
+	}
+	if cfg.PushIntervalSeconds <= 0 {
+		cfg.PushIntervalSeconds = 60
+	}
 	query := `
-	INSERT INTO display_configs (device_id, user_id, city_name, latitude, longitude, timezone, calendar_url, full_refresh_minutes, partial_refresh_minutes, created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+	INSERT INTO display_configs (device_id, user_id, city_name, latitude, longitude, timezone, calendar_url, full_refresh_minutes, partial_refresh_minutes, ble_mac, auto_push, push_interval_seconds, created_at, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 	ON CONFLICT(device_id) DO UPDATE SET
 		user_id = excluded.user_id,
 		city_name = excluded.city_name,
@@ -353,11 +366,15 @@ func (db *DB) SaveDisplayConfig(cfg *DisplayConfig) error {
 		calendar_url = excluded.calendar_url,
 		full_refresh_minutes = excluded.full_refresh_minutes,
 		partial_refresh_minutes = excluded.partial_refresh_minutes,
+		ble_mac = excluded.ble_mac,
+		auto_push = excluded.auto_push,
+		push_interval_seconds = excluded.push_interval_seconds,
 		updated_at = CURRENT_TIMESTAMP
 	`
 	_, err := db.conn.Exec(query,
 		cfg.DeviceID, cfg.UserID, cfg.CityName, cfg.Latitude, cfg.Longitude,
 		cfg.Timezone, cfg.CalendarURL, cfg.FullRefreshMinutes, cfg.PartialRefreshMinutes,
+		cfg.BLEMAC, autoPushInt, cfg.PushIntervalSeconds,
 	)
 	return err
 }
@@ -369,15 +386,18 @@ func (db *DB) DeleteDisplayConfig(deviceID string) error {
 
 func (db *DB) GetDisplayConfig(deviceID string) (*DisplayConfig, error) {
 	query := `
-	SELECT device_id, user_id, city_name, latitude, longitude, timezone, calendar_url, full_refresh_minutes, partial_refresh_minutes, created_at, updated_at
+	SELECT device_id, user_id, city_name, latitude, longitude, timezone, calendar_url, full_refresh_minutes, partial_refresh_minutes, ble_mac, auto_push, push_interval_seconds, created_at, updated_at
 	FROM display_configs WHERE device_id = ?
 	`
 	var c DisplayConfig
+	var autoPushInt int
 	err := db.conn.QueryRow(query, deviceID).Scan(
 		&c.DeviceID, &c.UserID, &c.CityName, &c.Latitude, &c.Longitude,
 		&c.Timezone, &c.CalendarURL, &c.FullRefreshMinutes, &c.PartialRefreshMinutes,
+		&c.BLEMAC, &autoPushInt, &c.PushIntervalSeconds,
 		&c.CreatedAt, &c.UpdatedAt,
 	)
+	c.AutoPush = (autoPushInt == 1)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil // not found
 	}
@@ -389,7 +409,7 @@ func (db *DB) GetDisplayConfig(deviceID string) (*DisplayConfig, error) {
 
 func (db *DB) ListDisplayConfigs(userID int64) ([]DisplayConfig, error) {
 	query := `
-	SELECT device_id, user_id, city_name, latitude, longitude, timezone, calendar_url, full_refresh_minutes, partial_refresh_minutes, created_at, updated_at
+	SELECT device_id, user_id, city_name, latitude, longitude, timezone, calendar_url, full_refresh_minutes, partial_refresh_minutes, ble_mac, auto_push, push_interval_seconds, created_at, updated_at
 	FROM display_configs WHERE user_id = ? ORDER BY device_id ASC
 	`
 	rows, err := db.conn.Query(query, userID)
@@ -401,13 +421,45 @@ func (db *DB) ListDisplayConfigs(userID int64) ([]DisplayConfig, error) {
 	var list []DisplayConfig
 	for rows.Next() {
 		var c DisplayConfig
+		var autoPushInt int
 		if err := rows.Scan(
 			&c.DeviceID, &c.UserID, &c.CityName, &c.Latitude, &c.Longitude,
 			&c.Timezone, &c.CalendarURL, &c.FullRefreshMinutes, &c.PartialRefreshMinutes,
+			&c.BLEMAC, &autoPushInt, &c.PushIntervalSeconds,
 			&c.CreatedAt, &c.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
+		c.AutoPush = (autoPushInt == 1)
+		list = append(list, c)
+	}
+	return list, rows.Err()
+}
+
+func (db *DB) GetAutoPushConfigs() ([]DisplayConfig, error) {
+	query := `
+	SELECT device_id, user_id, city_name, latitude, longitude, timezone, calendar_url, full_refresh_minutes, partial_refresh_minutes, ble_mac, auto_push, push_interval_seconds, created_at, updated_at
+	FROM display_configs WHERE auto_push = 1 AND ble_mac != ''
+	`
+	rows, err := db.conn.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []DisplayConfig
+	for rows.Next() {
+		var c DisplayConfig
+		var autoPushInt int
+		if err := rows.Scan(
+			&c.DeviceID, &c.UserID, &c.CityName, &c.Latitude, &c.Longitude,
+			&c.Timezone, &c.CalendarURL, &c.FullRefreshMinutes, &c.PartialRefreshMinutes,
+			&c.BLEMAC, &autoPushInt, &c.PushIntervalSeconds,
+			&c.CreatedAt, &c.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		c.AutoPush = true
 		list = append(list, c)
 	}
 	return list, rows.Err()

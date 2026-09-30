@@ -105,6 +105,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 }
 
 func (s *Server) Start() error {
+	// Start background OpenDisplay BLE auto-pusher service
+	s.displaySvc.StartAutoPusher(context.Background())
 	log.Printf("[NeonServices] API server listening on %s", s.httpServer.Addr)
 	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("http server failed: %w", err)

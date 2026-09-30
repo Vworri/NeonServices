@@ -9,6 +9,7 @@ import (
 	_ "image/png"
 	"io"
 	"mime/multipart"
+	"os/exec"
 	"net/http"
 	"strconv"
 	"strings"
@@ -73,6 +74,9 @@ type ManagerApp struct {
 	displayCalURLEntry         *widget.Entry
 	displayFullRefreshEntry    *widget.Entry
 	displayPartialRefreshEntry *widget.Entry
+	displayBLEMacEntry         *widget.Entry
+	displayAutoPushCheck       *widget.Check
+	displayPushIntervalEntry   *widget.Entry
 	displayUrlLabel            *widget.Label
 
 	// User Data / Cloud Files
@@ -540,6 +544,14 @@ func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
 	m.displayPartialRefreshEntry = widget.NewEntry()
 	m.displayPartialRefreshEntry.SetText("1")
 
+	m.displayBLEMacEntry = widget.NewEntry()
+	m.displayBLEMacEntry.SetText("AC:27:6E:A6:AA:F5")
+
+	m.displayAutoPushCheck = widget.NewCheck("Enable Option 1 Background BLE Auto-Push", nil)
+
+	m.displayPushIntervalEntry = widget.NewEntry()
+	m.displayPushIntervalEntry.SetText("60")
+
 	m.displayUrlLabel = widget.NewLabel("reTerminal OpenDisplay URL: " + m.apiBaseURL + "/api/v1/display/reterminal-01/image.png")
 	m.displayUrlLabel.Wrapping = fyne.TextWrapWord
 
@@ -581,6 +593,11 @@ func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
 
 	calendarHelpLabel := widget.NewLabelWithStyle("Tip: You can add multiple iCal calendars (personal, work, holidays). All feeds will be merged and chronologically sorted.", fyne.TextAlignLeading, fyne.TextStyle{Italic: true})
 
+	pushNowBtn := widget.NewButtonWithIcon("⚡ Push Screen Now (BLE)", theme.MediaPlayIcon(), func() {
+		m.pushToDisplayNow()
+	})
+	pushNowBtn.Importance = widget.HighImportance
+
 	form := widget.NewForm(
 		widget.NewFormItem("Device Identifier", m.displayDeviceIDEntry),
 		widget.NewFormItem("City Name", m.displayCityEntry),
@@ -590,6 +607,9 @@ func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
 		widget.NewFormItem("iCal Calendars (Multiple URLs)", m.displayCalURLEntry),
 		widget.NewFormItem("Full Refresh (minutes)", m.displayFullRefreshEntry),
 		widget.NewFormItem("Partial Refresh (minutes)", m.displayPartialRefreshEntry),
+		widget.NewFormItem("reTerminal BLE MAC", m.displayBLEMacEntry),
+		widget.NewFormItem("Auto-Push Service (Option 1)", m.displayAutoPushCheck),
+		widget.NewFormItem("Push Interval (Seconds)", m.displayPushIntervalEntry),
 	)
 
 	copyUrlBtn := widget.NewButtonWithIcon("Copy Easy URL (/screen)", theme.ContentCopyIcon(), func() {
@@ -620,7 +640,7 @@ func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
 		widget.NewSeparator(),
 		calendarHelpLabel,
 		form,
-		container.NewHBox(saveBtn, previewBtn, addEventBtn, copyUrlBtn),
+		container.NewHBox(saveBtn, pushNowBtn, previewBtn, addEventBtn, copyUrlBtn),
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("Device Integration Helper:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		m.displayUrlLabel,
@@ -686,6 +706,13 @@ func (m *ManagerApp) fetchDisplayConfigFor(deviceID string) {
 				m.displayCalURLEntry.SetText(res.Data.CalendarURL)
 				m.displayFullRefreshEntry.SetText(fmt.Sprintf("%d", res.Data.FullRefreshMinutes))
 				m.displayPartialRefreshEntry.SetText(fmt.Sprintf("%d", res.Data.PartialRefreshMinutes))
+				if res.Data.BLEMAC != "" {
+					m.displayBLEMacEntry.SetText(res.Data.BLEMAC)
+				}
+				m.displayAutoPushCheck.SetChecked(res.Data.AutoPush)
+				if res.Data.PushIntervalSeconds > 0 {
+					m.displayPushIntervalEntry.SetText(fmt.Sprintf("%d", res.Data.PushIntervalSeconds))
+				}
 			})
 		}
 	}()
@@ -700,6 +727,10 @@ func (m *ManagerApp) saveDisplayDevice() {
 	lon, _ := strconv.ParseFloat(m.displayLonEntry.Text, 64)
 	fullRef, _ := strconv.Atoi(m.displayFullRefreshEntry.Text)
 	partRef, _ := strconv.Atoi(m.displayPartialRefreshEntry.Text)
+	pushInt, _ := strconv.Atoi(m.displayPushIntervalEntry.Text)
+	if pushInt <= 0 {
+		pushInt = 60
+	}
 
 	payload := map[string]interface{}{
 		"device_id":               strings.TrimSpace(m.displayDeviceIDEntry.Text),
@@ -710,6 +741,9 @@ func (m *ManagerApp) saveDisplayDevice() {
 		"calendar_url":            m.displayCalURLEntry.Text,
 		"full_refresh_minutes":    fullRef,
 		"partial_refresh_minutes": partRef,
+		"ble_mac":                strings.TrimSpace(m.displayBLEMacEntry.Text),
+		"auto_push":              m.displayAutoPushCheck.Checked,
+		"push_interval_seconds":   pushInt,
 	}
 
 	go func() {
@@ -1721,6 +1755,66 @@ func (m *ManagerApp) buildNASTab() fyne.CanvasObject {
 }
 
 
+
+func (m *ManagerApp) pushToDisplayNow() {
+	devID := strings.TrimSpace(m.displayDeviceIDEntry.Text)
+	if devID == "" {
+		devID = "reterminal-01"
+	}
+	mac := strings.TrimSpace(m.displayBLEMacEntry.Text)
+	if mac == "" {
+		mac = "AC:27:6E:A6:AA:F5"
+	}
+
+	progressDialog := dialog.NewInformation("Pushing to reTerminal", "Connecting to reTerminal over BLE and uploading live 800x480 dashboard...\nPlease wait...", m.window)
+	progressDialog.Show()
+
+	go func() {
+		// First try server-side push endpoint
+		url := fmt.Sprintf("%s/api/v1/display/%s/push", m.apiBaseURL, devID)
+		req, _ := http.NewRequest("POST", url, nil)
+		if m.authToken != "" {
+			req.Header.Set("Authorization", "Bearer "+m.authToken)
+		}
+		resp, err := m.httpClient.Do(req)
+
+		// If server push failed (e.g. server is out of BLE range), fallback to local python pusher
+		if err != nil || (resp != nil && resp.StatusCode != http.StatusOK) {
+			script := "scripts/opendisplay_pusher.py"
+			targetURL := m.apiBaseURL + "/screen"
+			cmd := exec.Command("python3", script, "--mac", mac, "--url", targetURL, "--once")
+			out, localErr := cmd.CombinedOutput()
+			fyne.Do(func() {
+				progressDialog.Hide()
+				if localErr != nil {
+					dialog.ShowError(fmt.Errorf("Bluetooth Push Failed:\n\n%s\n%v\n\nEnsure py-opendisplay is installed: pip install py-opendisplay pillow requests", string(out), localErr), m.window)
+				} else {
+					dialog.ShowInformation("Screen Refreshed!", "🎉 Successfully pushed live dashboard to reTerminal E1001 over Bluetooth!\n\n"+string(out), m.window)
+				}
+			})
+			return
+		}
+		defer resp.Body.Close()
+
+		var res struct {
+			Success bool   `json:"success"`
+			Message string `json:"message"`
+			Output  string `json:"output"`
+			Error   string `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&res)
+
+		fyne.Do(func() {
+			progressDialog.Hide()
+			if res.Success {
+				dialog.ShowInformation("Screen Refreshed!", "🎉 Successfully refreshed reTerminal E1001 e-Paper screen!\n\n"+res.Output, m.window)
+			} else {
+				dialog.ShowError(fmt.Errorf("Push Failed: %s\n%s", res.Error, res.Output), m.window)
+			}
+		})
+	}()
+}
+
 func (m *ManagerApp) showEasySetupGuide() {
 	opt1 := `1. On your phone or laptop connected to Wi-Fi, open your reTerminal in your browser:
    http://opendisplay.local (or the IP shown on your reTerminal e-Paper)
@@ -1823,6 +1917,17 @@ func (m *ManagerApp) showBluetoothWizard() {
 		}()
 	})
 
+	pushWizardBtn := widget.NewButtonWithIcon("⚡ Push Live Screen Now (BLE)", theme.MediaPlayIcon(), func() {
+		mac := macToName[deviceSelect.Selected]
+		if mac == "" {
+			dialog.ShowInformation("No Device", "Please select a Bluetooth device from the list.", m.window)
+			return
+		}
+		m.displayBLEMacEntry.SetText(mac)
+		m.pushToDisplayNow()
+	})
+	pushWizardBtn.Importance = widget.HighImportance
+
 	programBtn := widget.NewButtonWithIcon("Program Device via BLE", theme.DocumentSaveIcon(), func() {
 		mac := macToName[deviceSelect.Selected]
 		if mac == "" {
@@ -1879,7 +1984,7 @@ func (m *ManagerApp) showBluetoothWizard() {
 		form,
 		encHelp,
 		widget.NewSeparator(),
-		container.NewHBox(programBtn, webToolboxBtn),
+		container.NewHBox(pushWizardBtn, programBtn, webToolboxBtn),
 	)
 
 	showWideDialog("reTerminal Bluetooth Provisioning", "Close", "", box, 680, 440, m.window, func(bool) {})

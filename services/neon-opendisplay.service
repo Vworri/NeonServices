@@ -1,0 +1,15 @@
+[Unit]
+Description=NeonServices OpenDisplay E-Paper BLE Pusher
+After=network.target bluetooth.target neonservices.service
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+User=lab
+WorkingDirectory=/home/lab/neonservices
+ExecStart=/usr/bin/python3 /home/lab/neonservices/scripts/opendisplay_pusher.py --mac AC:27:6E:A6:AA:F5 --url http://127.0.0.1:8080/screen --interval 60
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
