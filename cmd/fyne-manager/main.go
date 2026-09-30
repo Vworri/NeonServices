@@ -45,7 +45,7 @@ type ManagerApp struct {
 	portEntry *widget.Entry
 	userEntry *widget.Entry
 	keyEntry  *widget.Entry
-	passEntry *widget.PasswordEntry
+	passEntry *widget.Entry
 	connLabel *widget.Label
 
 	// Config inputs
@@ -477,7 +477,7 @@ func (m *ManagerApp) buildDisplayTab() fyne.CanvasObject {
 
 	btnRow := container.NewHBox(saveBtn, fetchBtn, previewBtn, addEventBtn)
 
-	headerDesc := widget.NewLabel("Configure the 7.5" 800x480 e-Paper display for Seeed Studio reTerminal E1001 OpenDisplay.")
+	headerDesc := widget.NewLabel("Configure the 7.5-inch 800x480 e-Paper display for Seeed Studio reTerminal E1001 OpenDisplay.")
 	headerDesc.Wrapping = fyne.TextWrapWord
 
 	return container.NewVBox(

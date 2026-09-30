@@ -1,4 +1,4 @@
-.PHONY: all build build-linux-amd64 build-linux-arm64 fyne-app test run deploy clean help
+.PHONY: all build build-linux-amd64 build-linux-arm64 fyne-app fyne-distrobox test run deploy clean help
 
 BIN_DIR := bin
 API_SERVER_BIN := $(BIN_DIR)/api-server
@@ -30,8 +30,14 @@ build-linux-arm64:
 fyne-app:
 	@mkdir -p $(BIN_DIR)
 	@echo "==> Building Fyne Desktop Manager..."
-	@echo "Note: Requires X11 / OpenGL development packages (libgl1-mesa-dev, xorg-dev)"
-	go build -o $(FYNE_BIN) ./cmd/fyne-manager
+	@echo "Note: If on an immutable host like Bazzite, run 'make fyne-distrobox'"
+	go build -o $(FYNE_BIN) ./cmd/fyne-manager || $(MAKE) fyne-distrobox
+	@echo "[+] Built: $(FYNE_BIN)"
+
+fyne-distrobox:
+	@mkdir -p $(BIN_DIR)
+	@echo "==> Building Fyne Desktop Manager inside Distrobox (dev)..."
+	distrobox enter dev -- go build -o $(FYNE_BIN) ./cmd/fyne-manager
 	@echo "[+] Built: $(FYNE_BIN)"
 
 run: build
@@ -55,6 +61,7 @@ help:
 	@echo "  make build               - Build local api-server and neon-ctl binaries"
 	@echo "  make build-linux-amd64   - Cross-compile static Linux x86_64 binary"
 	@echo "  make build-linux-arm64   - Cross-compile static Linux ARM64 binary"
+	@echo "  make fyne-distrobox      - Build Fyne GUI app inside Distrobox container"
 	@echo "  make fyne-app            - Build Fyne Desktop GUI Control Center"
 	@echo "  make run                 - Run api-server locally with test admin"
 	@echo "  make test                - Run unit and integration tests"
