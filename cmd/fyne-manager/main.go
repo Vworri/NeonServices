@@ -574,6 +574,20 @@ func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
 	})
 	saveBtn.Importance = widget.HighImportance
 
+	newDeviceBtn := widget.NewButtonWithIcon("+ Add Device", theme.ContentAddIcon(), func() {
+		nextID := fmt.Sprintf("reterminal-%02d", len(m.deviceSelect.Options)+1)
+		m.displayDeviceIDEntry.SetText(nextID)
+		m.displayCityEntry.SetText("New York, NY")
+		m.displayCalURLEntry.SetText("")
+		m.displayBLEMacEntry.SetText("")
+		m.displayAutoPushCheck.SetChecked(false)
+		m.displayPushIntervalEntry.SetText("60")
+		if m.displayUrlLabel != nil {
+			m.displayUrlLabel.SetText("reTerminal OpenDisplay URL: " + m.apiBaseURL + "/api/v1/display/" + nextID + "/image.png")
+		}
+		dialog.ShowInformation("New Device", fmt.Sprintf("Ready to configure %q!\nFill in your city, calendar feeds, and Bluetooth MAC address, then click \"Save Device Config\".", nextID), m.window)
+	})
+
 	deleteDeviceBtn := widget.NewButtonWithIcon("Delete Device", theme.DeleteIcon(), func() {
 		m.deleteCurrentDevice()
 	})
@@ -629,6 +643,7 @@ func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
 	topSelectorRow := container.NewHBox(
 		widget.NewLabelWithStyle("My Devices:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		m.deviceSelect,
+		newDeviceBtn,
 		refreshDevicesBtn,
 		deleteDeviceBtn,
 		bleBtn,

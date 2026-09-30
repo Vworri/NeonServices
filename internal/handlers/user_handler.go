@@ -140,6 +140,9 @@ type SaveDeviceRequest struct {
 	CalendarURL           string  `json:"calendar_url"`
 	FullRefreshMinutes    int     `json:"full_refresh_minutes"`
 	PartialRefreshMinutes int     `json:"partial_refresh_minutes"`
+	BLEMAC                string  `json:"ble_mac"`
+	AutoPush              bool    `json:"auto_push"`
+	PushIntervalSeconds   int     `json:"push_interval_seconds"`
 }
 
 func (h *UserHandler) SaveDevice(w http.ResponseWriter, r *http.Request) {
@@ -169,6 +172,10 @@ func (h *UserHandler) SaveDevice(w http.ResponseWriter, r *http.Request) {
 		req.PartialRefreshMinutes = 1
 	}
 
+	if req.PushIntervalSeconds <= 0 {
+		req.PushIntervalSeconds = 60
+	}
+
 	cfg := &database.DisplayConfig{
 		DeviceID:              strings.TrimSpace(req.DeviceID),
 		UserID:                claims.UserID,
@@ -179,6 +186,9 @@ func (h *UserHandler) SaveDevice(w http.ResponseWriter, r *http.Request) {
 		CalendarURL:           req.CalendarURL,
 		FullRefreshMinutes:    req.FullRefreshMinutes,
 		PartialRefreshMinutes: req.PartialRefreshMinutes,
+		BLEMAC:                req.BLEMAC,
+		AutoPush:              req.AutoPush,
+		PushIntervalSeconds:   req.PushIntervalSeconds,
 	}
 
 	if err := h.db.SaveDisplayConfig(cfg); err != nil {
