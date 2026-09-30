@@ -1757,6 +1757,8 @@ func (m *ManagerApp) showBluetoothWizard() {
 	wifiSSIDEntry.SetPlaceHolder("Your Wi-Fi Network Name")
 	wifiPassEntry := widget.NewPasswordEntry()
 	wifiPassEntry.SetPlaceHolder("Wi-Fi Password")
+	keyEntry := widget.NewEntry()
+	keyEntry.SetPlaceHolder("Optional: 32 hex chars (leave blank or all zeros if unencrypted)")
 	targetURLEntry := widget.NewEntry()
 	targetURLEntry.SetText(m.apiBaseURL + "/screen")
 
@@ -1859,10 +1861,13 @@ func (m *ManagerApp) showBluetoothWizard() {
 		dialog.ShowInformation("Copied", "Image URL copied to clipboard: "+targetURLEntry.Text, m.window)
 	})
 
+	encHelp := widget.NewLabelWithStyle("Note: If AES-CCM encryption is enabled on your reTerminal, enter your 32-hex key above, or click 'Open Web Bluetooth Toolbox' below.", fyne.TextAlignLeading, fyne.TextStyle{Italic: true})
+
 	form := widget.NewForm(
 		widget.NewFormItem("Target Device", container.NewBorder(nil, nil, nil, container.NewHBox(scanBtn, connectBtn), deviceSelect)),
 		widget.NewFormItem("Wi-Fi SSID", wifiSSIDEntry),
 		widget.NewFormItem("Wi-Fi Password", wifiPassEntry),
+		widget.NewFormItem("BLE Encryption Key", keyEntry),
 		widget.NewFormItem("Image URL to Flash", container.NewBorder(nil, nil, nil, copyUrlBtn, targetURLEntry)),
 	)
 
@@ -1872,6 +1877,7 @@ func (m *ManagerApp) showBluetoothWizard() {
 		widget.NewSeparator(),
 		statusLabel,
 		form,
+		encHelp,
 		widget.NewSeparator(),
 		container.NewHBox(programBtn, webToolboxBtn),
 	)
