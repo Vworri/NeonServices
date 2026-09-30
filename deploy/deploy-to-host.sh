@@ -3,14 +3,16 @@ set -euo pipefail
 
 # ==============================================================================
 # NeonServices Remote SSH Deployment & StationPC PocketCloud NAS Provisioner
+# Supports Block Devices (NVMe/SATA/USB) and Network Shares (SMB/CIFS/NFS)
 # ==============================================================================
 
-# Default parameters
 SSH_USER="ubuntu"
 SSH_PORT="22"
 SSH_KEY=""
 NAS_MOUNT_POINT="/mnt/pocketcloud"
-NAS_DEVICE="" # Optional, e.g. /dev/sdb1 or /dev/nvme0n1p1
+NAS_TARGET="" # Can be /dev/sdX1 or smb://host/share or //host/share
+SMB_USER="guest"
+SMB_PASS=""
 REMOTE_INSTALL_DIR="/opt/neonservices"
 FORCE_FORMAT=false
 SKIP_MOUNT=false
@@ -29,19 +31,21 @@ Options:
   -p, --port <port>       SSH port (default: 22)
   -i, --key <key_path>    SSH private key (default: ~/.ssh/id_ed25519 or ~/.ssh/id_rsa)
   -m, --mount <path>      NAS mount point (default: /mnt/pocketcloud)
-  -d, --device <dev>      NAS block device/partition to mount (e.g., /dev/sdb1 or /dev/sdb)
-  --format                Format the NAS device to ext4 if it has no filesystem
-  --skip-mount            Skip mounting block device (use existing directory or mount)
+  -d, --device <target>   NAS target: block device (/dev/sdb1) or network share (smb://sp-4b51.local/data)
+  --smb-user <user>       SMB share username (default: guest)
+  --smb-pass <pass>       SMB share password (optional)
+  --format                Format block device to ext4 if it has no filesystem
+  --skip-mount            Skip mounting (use local directory or existing mount)
   -h, --help              Show this help message
 
 Examples:
-  # Deploy using target IP and user:
-  ./deploy/deploy-to-host.sh lab@192.168.3.54
+  # Deploy with StationPC PocketCloud SMB network share:
+  ./deploy/deploy-to-host.sh lab@192.168.3.54 -d smb://sp-4b51.local/
 
-  # Deploy and mount specific NAS drive:
+  # Deploy with physical drive:
   ./deploy/deploy-to-host.sh lab@192.168.3.54 -d /dev/sdb1
 
-  # Deploy using local folder without mounting hardware disk:
+  # Deploy using local storage (skip mount):
   ./deploy/deploy-to-host.sh lab@192.168.3.54 --skip-mount
 HELP
   exit 0
@@ -75,8 +79,16 @@ while [[ $# -gt 0 ]]; do
       NAS_MOUNT_POINT="$2"
       shift 2
       ;;
-    -d|--device)
-      NAS_DEVICE="$2"
+    -d|--device|--nas|--smb)
+      NAS_TARGET="$2"
+      shift 2
+      ;;
+    --smb-user)
+      SMB_USER="$2"
+      shift 2
+      ;;
+    --smb-pass)
+      SMB_PASS="$2"
       shift 2
       ;;
     --format)
@@ -114,7 +126,7 @@ if [ -z "$REMOTE_HOST" ]; then
   usage
 fi
 
-# Resolve SSH Key if not provided
+# Resolve SSH Key
 if [ -z "$SSH_KEY" ]; then
   if [ -f "$HOME/.ssh/id_ed25519" ]; then
     SSH_KEY="$HOME/.ssh/id_ed25519"
@@ -123,26 +135,41 @@ if [ -z "$SSH_KEY" ]; then
   fi
 fi
 
-# Create temporary directory for SSH socket multiplexing (enter password once)
+# Create temporary directory for SSH ControlMaster multiplexing
 SOCKET_DIR=$(mktemp -d /tmp/neon-ssh-XXXXXX)
 SOCKET_PATH="$SOCKET_DIR/cm-%r@%h:%p"
-cleanup_socket() {
+cleanup() {
   ssh -O exit -S "$SOCKET_PATH" "$SSH_USER@$REMOTE_HOST" 2>/dev/null || true
   rm -rf "$SOCKET_DIR"
 }
-trap cleanup_socket EXIT
+trap cleanup EXIT
 
-SSH_OPTS=(-p "$SSH_PORT" -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o ControlMaster=auto -o ControlPath="$SOCKET_PATH" -o ControlPersist=5m)
+SSH_BASE=(-p "$SSH_PORT" -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o ControlMaster=auto -o ControlPath="$SOCKET_PATH" -o ControlPersist=5m)
 if [ -n "$SSH_KEY" ]; then
-  SSH_OPTS+=(-i "$SSH_KEY")
+  SSH_BASE+=(-i "$SSH_KEY")
 fi
 
 run_ssh() {
-  ssh "${SSH_OPTS[@]}" "$SSH_USER@$REMOTE_HOST" "$@"
+  ssh "${SSH_BASE[@]}" "$SSH_USER@$REMOTE_HOST" "$@"
+}
+
+run_ssh_interactive() {
+  # Allocate pseudo-terminal so sudo can read password if needed
+  ssh -tt "${SSH_BASE[@]}" "$SSH_USER@$REMOTE_HOST" "$@"
 }
 
 run_scp() {
   scp -P "$SSH_PORT" ${SSH_KEY:+-i "$SSH_KEY"} -o StrictHostKeyChecking=accept-new -o ControlPath="$SOCKET_PATH" "$@"
+}
+
+run_remote_script() {
+  local script_content="$1"
+  local tmp_local
+  tmp_local=$(mktemp /tmp/neon-step-XXXXXX.sh)
+  printf "%s\n" "$script_content" > "$tmp_local"
+  run_scp "$tmp_local" "$SSH_USER@$REMOTE_HOST:/tmp/neon-step.sh"
+  rm -f "$tmp_local"
+  run_ssh_interactive "sudo bash /tmp/neon-step.sh; rm -f /tmp/neon-step.sh"
 }
 
 echo "=================================================================="
@@ -158,7 +185,7 @@ fi
 
 # 2. Detect Remote Architecture
 echo "[2/7] Detecting remote CPU architecture..."
-REMOTE_ARCH=$(run_ssh "uname -m")
+REMOTE_ARCH=$(run_ssh "uname -m" | tr -d '\r\n')
 case "$REMOTE_ARCH" in
   x86_64)
     GOARCH="amd64"
@@ -176,89 +203,141 @@ case "$REMOTE_ARCH" in
 esac
 echo "[+] Target architecture: linux/$GOARCH"
 
-# 3. Verify & Provision NAS Mount
+# 3. Verify & Provision NAS Mount (SMB / Block / Local)
 echo "[3/7] Verifying StationPC PocketCloud NAS mount at $NAS_MOUNT_POINT..."
 
-REMOTE_MOUNT_SCRIPT=$(cat << REMOTE_EOF
+# Normalize SMB target if passed
+CLEAN_TARGET="$NAS_TARGET"
+if [[ "$CLEAN_TARGET" =~ ^smb://(.*)$ ]]; then
+  CLEAN_TARGET="//${BASH_REMATCH[1]}"
+fi
+if [[ "$CLEAN_TARGET" =~ ^cifs://(.*)$ ]]; then
+  CLEAN_TARGET="//${BASH_REMATCH[1]}"
+fi
+
+STEP3_SCRIPT=$(cat << REMOTE_EOF
 set -euo pipefail
 
 MOUNT_POINT="$NAS_MOUNT_POINT"
-DEVICE="$NAS_DEVICE"
+TARGET="$CLEAN_TARGET"
+SMB_USER="$SMB_USER"
+SMB_PASS="$SMB_PASS"
 FORCE_FMT="$FORCE_FORMAT"
 SKIP="$SKIP_MOUNT"
 STORAGE_DIR="\$MOUNT_POINT/storage"
 
+# Ensure neon user exists early
+if ! id "neon" &>/dev/null; then
+  echo "[+] Creating system service user 'neon'..."
+  useradd -r -s /bin/false -d /var/lib/neonservices neon || true
+fi
+NEON_UID=\$(id -u neon)
+NEON_GID=\$(id -g neon)
+
 if [ "\$SKIP" = "true" ]; then
-  echo "[i] Skipping physical drive mount (--skip-mount specified)."
-  sudo mkdir -p "\$STORAGE_DIR"
+  echo "[i] Skipping drive mount (--skip-mount specified)."
+  mkdir -p "\$STORAGE_DIR"
 elif findmnt -M "\$MOUNT_POINT" >/dev/null 2>&1; then
   echo "[+] \$MOUNT_POINT is already mounted:"
   findmnt -M "\$MOUNT_POINT" -o SOURCE,FSTYPE,SIZE,USED,AVAIL,TARGET || true
 else
-  echo "[!] \$MOUNT_POINT is NOT currently mounted."
+  echo "[!] \$MOUNT_POINT is not yet mounted."
 
-  # If device not passed, attempt discovery of unmounted candidate drives
-  if [ -z "\$DEVICE" ]; then
-    echo "[i] Scanning for available block devices on host:"
-    lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL || true
+  # Check if network share (starts with //)
+  if [[ "\$TARGET" =~ ^//([^/]+)(/.*)?\$ ]]; then
+    SMB_HOST="\${BASH_REMATCH[1]}"
+    SMB_SHARE="\${BASH_REMATCH[2]}"
+    # Trim trailing slash
+    SMB_SHARE="\${SMB_SHARE%/}"
 
-    # Look for unmounted partition or disk (excluding loop/ram devices)
-    CANDIDATE=\$(lsblk -rpno NAME,TYPE,MOUNTPOINT | awk '\$2~/^(part|disk)$/ && \$3=="" && \$1!~/loop/ {print \$1; exit}' || true)
-    if [ -n "\$CANDIDATE" ]; then
-      DEVICE="\$CANDIDATE"
-      echo "[i] Candidate unmounted drive detected: \$DEVICE"
+    echo "[i] Network share detected: host '\$SMB_HOST', share '\$SMB_SHARE'"
+
+    # Install cifs-utils & smbclient if not installed
+    if ! which mount.cifs &>/dev/null || ! which smbclient &>/dev/null; then
+      echo "[i] Installing cifs-utils and smbclient on Ubuntu..."
+      apt-get update -qq && apt-get install -y -qq cifs-utils smbclient
+    fi
+
+    # If share name was empty (e.g. //sp-4b51.local/), query available shares
+    if [ -z "\$SMB_SHARE" ] || [ "\$SMB_SHARE" = "/" ]; then
+      echo "[i] Discovering SMB shares on \$SMB_HOST..."
+      DISCOVERED=\$(smbclient -L "smb://\$SMB_HOST" -N -g 2>/dev/null | awk -F'|' '\$1=="Disk" && \$2!~/\$$/ {print \$2; exit}' || true)
+      if [ -n "\$DISCOVERED" ]; then
+        SMB_SHARE="/\$DISCOVERED"
+        TARGET="//\$SMB_HOST\$SMB_SHARE"
+        echo "[+] Auto-selected share: \$TARGET"
+      else
+        echo "[-] Could not automatically discover SMB share names."
+        echo "    Shares visible on \$SMB_HOST:"
+        smbclient -L "smb://\$SMB_HOST" -N 2>/dev/null || true
+        echo "[-] Please specify share path, e.g.: -d smb://\$SMB_HOST/share_name"
+        exit 1
+      fi
+    fi
+
+    mkdir -p "\$MOUNT_POINT"
+
+    # Build mount options
+    MOUNT_OPTS="rw,uid=\$NEON_UID,gid=\$NEON_GID,file_mode=0775,dir_mode=0775,iocharset=utf8,_netdev,nofail"
+    if [ -n "\$SMB_PASS" ]; then
+      CRED_FILE="/etc/neon-smb.cred"
+      cat << CRED_EOF > "\$CRED_FILE"
+username=\$SMB_USER
+password=\$SMB_PASS
+CRED_EOF
+      chmod 600 "\$CRED_FILE"
+      MOUNT_OPTS="credentials=\$CRED_FILE,\$MOUNT_OPTS"
     else
-      echo "[!] No unmounted external partition auto-detected."
-      echo "[i] Using local directory at \$STORAGE_DIR for now."
-      echo "[i] You can attach the NAS drive later and run:"
-      echo "    ./deploy/deploy-to-host.sh $SSH_USER@$REMOTE_HOST -d /dev/sdX1"
-      sudo mkdir -p "\$STORAGE_DIR"
+      MOUNT_OPTS="guest,\$MOUNT_OPTS"
     fi
-  fi
 
-  if [ -n "\$DEVICE" ]; then
-    echo "[i] Checking block device \$DEVICE..."
-    if [ -b "\$DEVICE" ]; then
-      CURRENT_FS=\$(blkid -s TYPE -o value "\$DEVICE" || true)
-      if [ -z "\$CURRENT_FS" ]; then
-        if [ "\$FORCE_FMT" = "true" ]; then
-          echo "[!] Formatting \$DEVICE to ext4..."
-          sudo mkfs.ext4 -F -L "PocketCloud" "\$DEVICE"
-        else
-          echo "[-] Warning: \$DEVICE has no filesystem. Re-run with --format to format."
-        fi
-      fi
+    echo "[+] Mounting SMB share \$TARGET to \$MOUNT_POINT..."
+    mount -t cifs "\$TARGET" "\$MOUNT_POINT" -o "\$MOUNT_OPTS"
 
-      sudo mkdir -p "\$MOUNT_POINT"
-      if [ -n "\$(blkid -s TYPE -o value "\$DEVICE" || true)" ]; then
-        echo "[+] Mounting \$DEVICE to \$MOUNT_POINT..."
-        sudo mount "\$DEVICE" "\$MOUNT_POINT" || true
-        DEV_UUID=\$(blkid -s UUID -o value "\$DEVICE" || true)
-        if [ -n "\$DEV_UUID" ] && ! grep -q "\$DEV_UUID" /etc/fstab; then
-          echo "UUID=\$DEV_UUID \$MOUNT_POINT ext4 defaults,noatime,nofail 0 2" | sudo tee -a /etc/fstab
-        fi
+    # Add to /etc/fstab if not present
+    FSTAB_LINE="\$TARGET \$MOUNT_POINT cifs \$MOUNT_OPTS 0 0"
+    if ! grep -q "\$TARGET" /etc/fstab; then
+      echo "[+] Adding persistent mount to /etc/fstab..."
+      echo "\$FSTAB_LINE" >> /etc/fstab
+    fi
+
+  # Block device handling
+  elif [ -n "\$TARGET" ] && [ -b "\$TARGET" ]; then
+    echo "[i] Block device specified: \$TARGET"
+    CURRENT_FS=\$(blkid -s TYPE -o value "\$TARGET" || true)
+    if [ -z "\$CURRENT_FS" ]; then
+      if [ "\$FORCE_FMT" = "true" ]; then
+        echo "[!] Formatting \$TARGET to ext4..."
+        mkfs.ext4 -F -L "PocketCloud" "\$TARGET"
+      else
+        echo "[-] \$TARGET has no filesystem. Re-run with --format to format."
+        exit 1
       fi
     fi
+    mkdir -p "\$MOUNT_POINT"
+    echo "[+] Mounting \$TARGET to \$MOUNT_POINT..."
+    mount "\$TARGET" "\$MOUNT_POINT"
+    DEV_UUID=\$(blkid -s UUID -o value "\$TARGET" || true)
+    if [ -n "\$DEV_UUID" ] && ! grep -q "\$DEV_UUID" /etc/fstab; then
+      echo "UUID=\$DEV_UUID \$MOUNT_POINT ext4 defaults,noatime,nofail 0 2" >> /etc/fstab
+    fi
+
+  else
+    echo "[i] No specific NAS target mounted. Using local storage at \$STORAGE_DIR"
+    echo "[i] You can attach/mount your StationPC PocketCloud anytime and re-run:"
+    echo "    ./deploy/deploy-to-host.sh $SSH_USER@$REMOTE_HOST -d smb://sp-4b51.local/<share>"
+    mkdir -p "\$STORAGE_DIR"
   fi
 fi
 
-# Ensure storage directory exists and has correct permissions
-sudo mkdir -p "\$STORAGE_DIR"
-
-# Ensure neon user exists
-if ! id "neon" &>/dev/null; then
-  echo "[+] Creating system service user 'neon'..."
-  sudo useradd -r -s /bin/false -d /var/lib/neonservices neon || true
-fi
-
-# Set ownership and permissions for neon service
-sudo chown -R neon:neon "\$STORAGE_DIR"
-sudo chmod 775 "\$STORAGE_DIR"
-echo "[+] Storage directory verified: \$STORAGE_DIR"
+mkdir -p "\$STORAGE_DIR"
+chown -R neon:neon "\$STORAGE_DIR" 2>/dev/null || true
+chmod 775 "\$STORAGE_DIR" 2>/dev/null || true
+echo "[+] NAS storage directory verified: \$STORAGE_DIR"
 REMOTE_EOF
 )
 
-run_ssh "bash -s" <<< "$REMOTE_MOUNT_SCRIPT"
+run_remote_script "$STEP3_SCRIPT"
 
 # 4. Compile Standalone Go Binaries Locally
 echo "[4/7] Compiling static binaries for linux/$GOARCH..."
@@ -269,19 +348,19 @@ echo "[+] Built: bin/api-server-linux-$GOARCH and bin/neon-ctl-linux-$GOARCH"
 
 # 5. Prepare Remote Installation Directory and Transfer Files
 echo "[5/7] Deploying binaries to $REMOTE_HOST:$REMOTE_INSTALL_DIR..."
-run_ssh "sudo mkdir -p $REMOTE_INSTALL_DIR /var/lib/neonservices && sudo chown -R $SSH_USER:$SSH_USER $REMOTE_INSTALL_DIR"
+run_ssh_interactive "sudo mkdir -p $REMOTE_INSTALL_DIR /var/lib/neonservices && sudo chown -R $SSH_USER:$SSH_USER $REMOTE_INSTALL_DIR"
 
 run_scp "bin/api-server-linux-$GOARCH" "$SSH_USER@$REMOTE_HOST:$REMOTE_INSTALL_DIR/api-server.new"
 run_scp "bin/neon-ctl-linux-$GOARCH" "$SSH_USER@$REMOTE_HOST:$REMOTE_INSTALL_DIR/neon-ctl.new"
 
-run_ssh "chmod +x $REMOTE_INSTALL_DIR/api-server.new $REMOTE_INSTALL_DIR/neon-ctl.new && \
+run_ssh_interactive "chmod +x $REMOTE_INSTALL_DIR/api-server.new $REMOTE_INSTALL_DIR/neon-ctl.new && \
          mv $REMOTE_INSTALL_DIR/api-server.new $REMOTE_INSTALL_DIR/api-server && \
          mv $REMOTE_INSTALL_DIR/neon-ctl.new $REMOTE_INSTALL_DIR/neon-ctl && \
          sudo ln -sf $REMOTE_INSTALL_DIR/neon-ctl /usr/local/bin/neon-ctl || true"
 
 # 6. Setup Configuration and Secrets on Remote
 echo "[6/7] Checking remote configuration and secrets..."
-CONFIG_SETUP_SCRIPT=$(cat << REMOTE_CONF_EOF
+STEP6_SCRIPT=$(cat << REMOTE_CONF_EOF
 set -euo pipefail
 DIR="$REMOTE_INSTALL_DIR"
 MOUNT="$NAS_MOUNT_POINT/storage"
@@ -320,19 +399,19 @@ else
 fi
 
 # Ensure neon owns directories and config has restricted 0600 permissions
-sudo chown -R neon:neon "$REMOTE_INSTALL_DIR" "/var/lib/neonservices"
-sudo chmod 600 "\$DIR/config.yaml"
-sudo chmod 750 "$REMOTE_INSTALL_DIR" "/var/lib/neonservices"
+chown -R neon:neon "$REMOTE_INSTALL_DIR" "/var/lib/neonservices"
+chmod 600 "\$DIR/config.yaml"
+chmod 750 "$REMOTE_INSTALL_DIR" "/var/lib/neonservices"
 REMOTE_CONF_EOF
 )
 
-run_ssh "bash -s" <<< "$CONFIG_SETUP_SCRIPT"
+run_remote_script "$STEP6_SCRIPT"
 
 # 7. Install Systemd Service and Restart
 echo "[7/7] Installing systemd unit and starting NeonServices..."
 run_scp "deploy/systemd/neonservices.service" "$SSH_USER@$REMOTE_HOST:/tmp/neonservices.service"
 
-run_ssh "sudo cp /tmp/neonservices.service /etc/systemd/system/neonservices.service && \
+run_ssh_interactive "sudo cp /tmp/neonservices.service /etc/systemd/system/neonservices.service && \
          sudo systemctl daemon-reload && \
          sudo systemctl enable neonservices && \
          sudo systemctl restart neonservices"
@@ -342,7 +421,7 @@ echo ""
 echo "[*] Waiting for service to report active status..."
 sleep 2
 
-STATUS_OUTPUT=$(run_ssh "systemctl is-active neonservices || true")
+STATUS_OUTPUT=$(run_ssh "systemctl is-active neonservices || true" | tr -d '\r\n')
 if [ "$STATUS_OUTPUT" != "active" ]; then
   echo "[-] Service failed to start! Fetching last 20 log lines:"
   run_ssh "journalctl -u neonservices -n 20 --no-pager"
@@ -357,7 +436,7 @@ echo "    Response: $HEALTH_CHECK"
 
 echo ""
 echo "=================================================================="
-echo " 🎉 Deployment Complete!"
+echo " 🎉 Deployment and StationPC PocketCloud NAS Setup Complete!"
 echo "=================================================================="
 echo " - Remote API Base:    http://$REMOTE_HOST:8080/api/v1"
 echo " - NAS Storage Path:   $NAS_MOUNT_POINT/storage"
