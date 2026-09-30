@@ -1,0 +1,41 @@
+# NeonServices Configuration Template
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout: 15s
+  write_timeout: 30s
+  shutdown_timeout: 10s
+  env: "production" # "development" or "production"
+
+auth:
+  # Generate a 256-bit secret using: ./bin/neon-ctl gen-secret or via the Fyne Manager
+  jwt_secret: "REPLACE_WITH_YOUR_GENERATED_SECURE_JWT_SECRET_KEY"
+  token_ttl: 24h
+  allow_registration: true # Set to false after creating your initial admin account
+
+database:
+  path: "/var/lib/neonservices/neonservices.db"
+
+storage:
+  # StationPC PocketCloud NAS mount point on your Ubuntu machine
+  # Example: /mnt/pocketcloud or /media/nas/storage
+  base_mount_path: "/mnt/pocketcloud/storage"
+  
+  # Default user quota in bytes (50 GB = 53687091200)
+  default_quota_bytes: 53687091200
+  
+  # Max upload size per file in megabytes (e.g., 2048 MB = 2 GB)
+  max_upload_size_mb: 2048
+  
+  # Check if NAS mount is accessible before serving storage requests
+  check_mount_available: true
+
+ssh:
+  # SSH connection details for deployment and Fyne Management Desktop App
+  host: "192.168.1.100"
+  port: 22
+  user: "ubuntu"
+  key_path: "~/.ssh/id_ed25519"
+  remote_dir: "/opt/neonservices"
+  service_name: "neonservices"

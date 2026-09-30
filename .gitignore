@@ -1,0 +1,28 @@
+# Binaries
+bin/
+*.exe
+*.test
+
+# SQLite databases & temp files
+*.db
+*.db-shm
+*.db-wal
+data/
+storage/
+
+# Secrets and local configurations
+config.yaml
+!config.example.yaml
+*.key
+*.pem
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+*.swp

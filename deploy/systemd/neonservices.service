@@ -1,0 +1,29 @@
+[Unit]
+Description=NeonServices Multi-User Backend & StationPC PocketCloud NAS Gateway
+After=network.target local-fs.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=neon
+Group=neon
+WorkingDirectory=/opt/neonservices
+ExecStart=/opt/neonservices/api-server -config /opt/neonservices/config.yaml
+Restart=always
+RestartSec=5s
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/var/lib/neonservices /mnt/pocketcloud
+
+# Environment
+Environment=GIN_MODE=release
+
+# Resource limits
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
