@@ -30,6 +30,7 @@ type Claims struct {
 	UserID   int64         `json:"user_id"`
 	Username string        `json:"username"`
 	Role     database.Role `json:"role"`
+	APIKey   string        `json:"api_key,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -49,7 +50,7 @@ func CheckPassword(password, hash string) bool {
 }
 
 // GenerateToken creates a signed JWT for the given user
-func GenerateToken(userID int64, username string, role database.Role, secret string, ttl time.Duration) (string, error) {
+func GenerateToken(userID int64, username string, role database.Role, apiKey string, secret string, ttl time.Duration) (string, error) {
 	if secret == "" {
 		return "", errors.New("JWT secret is empty")
 	}
@@ -58,6 +59,7 @@ func GenerateToken(userID int64, username string, role database.Role, secret str
 		UserID:   userID,
 		Username: username,
 		Role:     role,
+		APIKey:   apiKey,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(ttl)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
@@ -91,13 +93,34 @@ func ValidateToken(tokenStr, secret string) (*Claims, error) {
 	return claims, nil
 }
 
-// Middleware creates an HTTP authentication middleware
-func Middleware(secret string) func(http.Handler) http.Handler {
+// Middleware creates an HTTP authentication middleware supporting JWT and API Key
+func Middleware(secret string, db *database.DB) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// 1. Check API Key header or query param
+			apiKey := r.Header.Get("X-API-Key")
+			if apiKey == "" {
+				apiKey = r.URL.Query().Get("api_key")
+			}
+			if apiKey != "" && db != nil {
+				user, err := db.GetUserByAPIKey(apiKey)
+				if err == nil {
+					claims := &Claims{
+						UserID:   user.ID,
+						Username: user.Username,
+						Role:     user.Role,
+						APIKey:   user.APIKey,
+					}
+					ctx := context.WithValue(r.Context(), UserContextKey, claims)
+					next.ServeHTTP(w, r.WithContext(ctx))
+					return
+				}
+			}
+
+			// 2. Check JWT Bearer token
 			tokenStr := extractToken(r)
 			if tokenStr == "" {
-				http.Error(w, `{"error":"missing authorization token"}`, http.StatusUnauthorized)
+				http.Error(w, `{"error":"missing authorization token or api key"}`, http.StatusUnauthorized)
 				return
 			}
 
@@ -124,7 +147,7 @@ func RequireRole(role database.Role) func(http.Handler) http.Handler {
 			}
 
 			if claims.Role != role && claims.Role != database.RoleAdmin {
-				http.Error(w, `{"error":"insufficient permissions"}`, http.StatusForbidden)
+				http.Error(w, `{"error":"insufficient permissions: admin required"}`, http.StatusForbidden)
 				return
 			}
 
@@ -140,7 +163,6 @@ func GetUserFromContext(ctx context.Context) (*Claims, bool) {
 }
 
 func extractToken(r *http.Request) string {
-	// 1. Authorization header: Bearer <token>
 	authHeader := r.Header.Get("Authorization")
 	if authHeader != "" {
 		parts := strings.Split(authHeader, " ")
@@ -149,7 +171,6 @@ func extractToken(r *http.Request) string {
 		}
 	}
 
-	// 2. Query param (useful for direct file streaming / downloads via browser)
 	if queryToken := r.URL.Query().Get("token"); queryToken != "" {
 		return queryToken
 	}

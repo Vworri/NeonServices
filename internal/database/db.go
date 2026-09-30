@@ -1,7 +1,9 @@
 package database
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -49,6 +51,12 @@ func (db *DB) Close() error {
 	return db.conn.Close()
 }
 
+func GenerateAPIKey() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return "neon_" + hex.EncodeToString(b)
+}
+
 func (db *DB) migrate() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS users (
@@ -57,6 +65,7 @@ func (db *DB) migrate() error {
 		email TEXT UNIQUE NOT NULL,
 		password_hash TEXT NOT NULL,
 		role TEXT NOT NULL DEFAULT 'user',
+		api_key TEXT UNIQUE,
 		quota_bytes INTEGER NOT NULL DEFAULT 53687091200,
 		storage_used_bytes INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -75,6 +84,7 @@ func (db *DB) migrate() error {
 		details TEXT,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
+
 	CREATE TABLE IF NOT EXISTS display_configs (
 		device_id TEXT PRIMARY KEY,
 		user_id INTEGER NOT NULL,
@@ -99,20 +109,46 @@ func (db *DB) migrate() error {
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
 	`
-	_, err := db.conn.Exec(schema)
-	return err
+	if _, err := db.conn.Exec(schema); err != nil {
+		return err
+	}
+
+	// Safe alter table for existing databases created before api_key column
+	_, _ = db.conn.Exec("ALTER TABLE users ADD COLUMN api_key TEXT;")
+	_, _ = db.conn.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key);")
+
+	// Backfill any users without an API key
+	rows, err := db.conn.Query("SELECT id FROM users WHERE api_key IS NULL OR api_key = ''")
+	if err == nil {
+		var ids []int64
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err == nil {
+				ids = append(ids, id)
+			}
+		}
+		rows.Close()
+		for _, id := range ids {
+			_, _ = db.conn.Exec("UPDATE users SET api_key = ? WHERE id = ?", GenerateAPIKey(), id)
+		}
+	}
+
+	return nil
 }
 
 func (db *DB) CreateUser(u *User) error {
 	query := `
-	INSERT INTO users (username, email, password_hash, role, quota_bytes, storage_used_bytes, created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	INSERT INTO users (username, email, password_hash, role, api_key, quota_bytes, storage_used_bytes, created_at, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 	now := time.Now().UTC()
 	u.CreatedAt = now
 	u.UpdatedAt = now
+	if u.APIKey == "" {
+		u.APIKey = GenerateAPIKey()
+	}
 
-	res, err := db.conn.Exec(query, u.Username, u.Email, u.PasswordHash, u.Role, u.QuotaBytes, u.StorageUsedBytes, now, now)
+	res, err := db.conn.Exec(query, u.Username, u.Email, u.PasswordHash, u.Role, u.APIKey, u.QuotaBytes, u.StorageUsedBytes, now, now)
 	if err != nil {
 		return ErrUserAlreadyExists
 	}
@@ -125,14 +161,96 @@ func (db *DB) CreateUser(u *User) error {
 	return nil
 }
 
+func (db *DB) UpdateUser(u *User) error {
+	var query string
+	var args []interface{}
+
+	if u.PasswordHash != "" {
+		if u.APIKey != "" {
+			query = `
+			UPDATE users
+			SET username = ?, email = ?, password_hash = ?, role = ?, quota_bytes = ?, api_key = ?, updated_at = CURRENT_TIMESTAMP
+			WHERE id = ?
+			`
+			args = []interface{}{u.Username, u.Email, u.PasswordHash, u.Role, u.QuotaBytes, u.APIKey, u.ID}
+		} else {
+			query = `
+			UPDATE users
+			SET username = ?, email = ?, password_hash = ?, role = ?, quota_bytes = ?, updated_at = CURRENT_TIMESTAMP
+			WHERE id = ?
+			`
+			args = []interface{}{u.Username, u.Email, u.PasswordHash, u.Role, u.QuotaBytes, u.ID}
+		}
+	} else {
+		if u.APIKey != "" {
+			query = `
+			UPDATE users
+			SET username = ?, email = ?, role = ?, quota_bytes = ?, api_key = ?, updated_at = CURRENT_TIMESTAMP
+			WHERE id = ?
+			`
+			args = []interface{}{u.Username, u.Email, u.Role, u.QuotaBytes, u.APIKey, u.ID}
+		} else {
+			query = `
+			UPDATE users
+			SET username = ?, email = ?, role = ?, quota_bytes = ?, updated_at = CURRENT_TIMESTAMP
+			WHERE id = ?
+			`
+			args = []interface{}{u.Username, u.Email, u.Role, u.QuotaBytes, u.ID}
+		}
+	}
+
+	_, err := db.conn.Exec(query, args...)
+	return err
+}
+
+func (db *DB) DeleteUser(userID int64) error {
+	// Delete user's devices
+	_, _ = db.conn.Exec("DELETE FROM display_configs WHERE user_id = ?", userID)
+	// Delete user record
+	_, err := db.conn.Exec("DELETE FROM users WHERE id = ?", userID)
+	return err
+}
+
+func (db *DB) RegenerateAPIKey(userID int64) (string, error) {
+	newKey := GenerateAPIKey()
+	query := "UPDATE users SET api_key = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+	_, err := db.conn.Exec(query, newKey, userID)
+	if err != nil {
+		return "", err
+	}
+	return newKey, nil
+}
+
+func (db *DB) GetUserByAPIKey(apiKey string) (*User, error) {
+	if apiKey == "" {
+		return nil, ErrUserNotFound
+	}
+	query := `
+	SELECT id, username, email, password_hash, role, coalesce(api_key, ''), quota_bytes, storage_used_bytes, created_at, updated_at
+	FROM users WHERE api_key = ?
+	`
+	var u User
+	err := db.conn.QueryRow(query, apiKey).Scan(
+		&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.Role, &u.APIKey,
+		&u.QuotaBytes, &u.StorageUsedBytes, &u.CreatedAt, &u.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrUserNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
 func (db *DB) GetUserByUsername(username string) (*User, error) {
 	query := `
-	SELECT id, username, email, password_hash, role, quota_bytes, storage_used_bytes, created_at, updated_at
+	SELECT id, username, email, password_hash, role, coalesce(api_key, ''), quota_bytes, storage_used_bytes, created_at, updated_at
 	FROM users WHERE username = ?
 	`
 	var u User
 	err := db.conn.QueryRow(query, username).Scan(
-		&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.Role,
+		&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.Role, &u.APIKey,
 		&u.QuotaBytes, &u.StorageUsedBytes, &u.CreatedAt, &u.UpdatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -146,12 +264,12 @@ func (db *DB) GetUserByUsername(username string) (*User, error) {
 
 func (db *DB) GetUserByID(id int64) (*User, error) {
 	query := `
-	SELECT id, username, email, password_hash, role, quota_bytes, storage_used_bytes, created_at, updated_at
+	SELECT id, username, email, password_hash, role, coalesce(api_key, ''), quota_bytes, storage_used_bytes, created_at, updated_at
 	FROM users WHERE id = ?
 	`
 	var u User
 	err := db.conn.QueryRow(query, id).Scan(
-		&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.Role,
+		&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.Role, &u.APIKey,
 		&u.QuotaBytes, &u.StorageUsedBytes, &u.CreatedAt, &u.UpdatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -165,7 +283,7 @@ func (db *DB) GetUserByID(id int64) (*User, error) {
 
 func (db *DB) ListUsers() ([]User, error) {
 	query := `
-	SELECT id, username, email, role, quota_bytes, storage_used_bytes, created_at, updated_at
+	SELECT id, username, email, role, coalesce(api_key, ''), quota_bytes, storage_used_bytes, created_at, updated_at
 	FROM users ORDER BY id ASC
 	`
 	rows, err := db.conn.Query(query)
@@ -177,7 +295,7 @@ func (db *DB) ListUsers() ([]User, error) {
 	var users []User
 	for rows.Next() {
 		var u User
-		if err := rows.Scan(&u.ID, &u.Username, &u.Email, &u.Role, &u.QuotaBytes, &u.StorageUsedBytes, &u.CreatedAt, &u.UpdatedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Username, &u.Email, &u.Role, &u.APIKey, &u.QuotaBytes, &u.StorageUsedBytes, &u.CreatedAt, &u.UpdatedAt); err != nil {
 			return nil, err
 		}
 		users = append(users, u)
@@ -241,6 +359,11 @@ func (db *DB) SaveDisplayConfig(cfg *DisplayConfig) error {
 		cfg.DeviceID, cfg.UserID, cfg.CityName, cfg.Latitude, cfg.Longitude,
 		cfg.Timezone, cfg.CalendarURL, cfg.FullRefreshMinutes, cfg.PartialRefreshMinutes,
 	)
+	return err
+}
+
+func (db *DB) DeleteDisplayConfig(deviceID string) error {
+	_, err := db.conn.Exec("DELETE FROM display_configs WHERE device_id = ?", deviceID)
 	return err
 }
 

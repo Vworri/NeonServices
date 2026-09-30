@@ -108,7 +108,7 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 	// Prepare user directory on NAS storage
 	_, _ = h.storage.GetUserRootDir(user.Username)
 
-	token, err := auth.GenerateToken(user.ID, user.Username, user.Role, h.jwtSecret, h.tokenTTL)
+	token, err := auth.GenerateToken(user.ID, user.Username, user.Role, user.APIKey, h.jwtSecret, h.tokenTTL)
 	if err != nil {
 		Error(w, http.StatusInternalServerError, "Failed to generate token")
 		return
@@ -146,7 +146,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := auth.GenerateToken(user.ID, user.Username, user.Role, h.jwtSecret, h.tokenTTL)
+	token, err := auth.GenerateToken(user.ID, user.Username, user.Role, user.APIKey, h.jwtSecret, h.tokenTTL)
 	if err != nil {
 		Error(w, http.StatusInternalServerError, "Failed to generate token")
 		return

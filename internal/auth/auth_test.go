@@ -25,7 +25,7 @@ func TestPasswordHashing(t *testing.T) {
 
 func TestJWTGenerationAndValidation(t *testing.T) {
 	secret := "test-secret-key-32-bytes-long-min"
-	token, err := GenerateToken(42, "testuser", database.RoleUser, secret, 1*time.Hour)
+	token, err := GenerateToken(42, "testuser", database.RoleUser, "neon_test123", secret, 1*time.Hour)
 	if err != nil {
 		t.Fatalf("GenerateToken failed: %v", err)
 	}

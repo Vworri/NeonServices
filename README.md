@@ -127,7 +127,7 @@ To deploy to your Ubuntu machine and ensure the StationPC PocketCloud NAS is mou
 1. **Checks SSH Connectivity**: Tests connection with target credentials.
 2. **Detects CPU Architecture**: Maps `x86_64` -> `amd64` or `aarch64` -> `arm64`.
 3. **Verifies & Mounts the NAS**:
-   - Checks if `/mnt/pocketcloud` is already mounted via `findmnt`.
+   - Checks if `/mnt/pocketcloud` is already mounted via `findmnt`. 
    - If unmounted, locates the block device (or uses `-d <device>`).
    - Mounts the partition to `/mnt/pocketcloud`.
    - Adds the disk UUID to `/etc/fstab` (`defaults,noatime,nofail 0 2`) so it persists on boot.
@@ -257,3 +257,54 @@ export NEON_WORKER_USER="admin"
 export NEON_WORKER_PASS="your-password"
 python nas_worker.py
 ```
+
+---
+
+## Fyne Control Center (Desktop App)
+
+A native graphical management interface built with Fyne v2.
+
+### Launching on Host (Bazzite / Linux)
+Because Bazzite is an immutable OS, compile the CGO OpenGL/X11 dependencies inside the `dev` distrobox container and run the output binary directly on the host:
+
+```bash
+# Build binary inside distrobox
+distrobox enter dev -- go build -o bin/fyne-manager ./cmd/fyne-manager
+
+# Launch native GUI on Bazzite host
+./bin/fyne-manager
+```
+
+### Features & Tabs
+1. **Header & Authentication**:
+   - **Log In / Log Out**: Authenticate against the backend using JWT (`POST /api/v1/auth/login`).
+   - Role indicator: Displays current username and access tier (`ADMIN` or `USER`).
+2. **My Profile**:
+   - Inspect user account details, quota usage percentage, and registration timestamp.
+   - View, copy, or regenerate your personal **API Key** for CLI/REST access.
+   - Update account password with verification.
+3. **My Devices (reTerminal E1001 / OpenDisplay)**:
+   - Manage your own registered e-Paper display devices (`GET/POST/DELETE /api/v1/user/devices`).
+   - Configure local weather coordinates, timezone, city, and iCal calendar feeds.
+   - Set full and partial refresh intervals.
+   - Real-time **Preview 800x480 e-Paper** canvas rendering with monochrome layout preview.
+   - Quick **Add Calendar Event** dialog.
+4. **My Cloud Files & Data**:
+   - Monitor storage quota usage against your allocated NAS quota.
+   - List files stored in your sandboxed StationPC PocketCloud NAS directory.
+   - **Upload File to NAS** using native file dialogs.
+   - **Download** or **Delete** existing cloud files.
+5. **Admin: User Management** (Admin Only):
+   - **Create New User**: Specify Username, Password, Role (`user`/`admin`), Quota (GB), and optional custom **API Key** (auto-generates 32-byte key if blank).
+   - **Edit User**: Modify username, email, role, quota, password, and custom **API Key**.
+   - **Delete User**: Permanently remove user and their cloud files from the NAS.
+   - **Regenerate API Key**: Issue instant new API keys for any user.
+6. **Admin: System Settings** (Admin Only):
+   - Configure server port, NAS base mount path (`/mnt/pocketcloud/storage`), default user quotas, and maximum upload limits.
+   - Toggle public user self-registration.
+   - Monitor server health, uptime, memory allocation, and NAS hardware status.
+7. **SSH & Host Service**:
+   - Connect directly to the Ubuntu server (`192.168.3.54`) via SSH.
+   - Control `neonservices.service` (Start, Stop, Restart) and view live journalctl logs.
+8. **NAS Mount**:
+   - Inspect physical partition, filesystem, and mount status on the host (`df -h /mnt/pocketcloud`).

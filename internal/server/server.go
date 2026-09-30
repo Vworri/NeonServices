@@ -59,9 +59,10 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	)
 
 	storageHandler := handlers.NewStorageHandler(s.db, s.storageMgr)
-	adminHandler := handlers.NewAdminHandler(s.db, s.storageMgr)
+	adminHandler := handlers.NewAdminHandler(s.db, s.storageMgr, s.cfg)
+	userHandler := handlers.NewUserHandler(s.db, s.storageMgr)
 
-	authMiddleware := auth.Middleware(s.cfg.Auth.JWTSecret)
+	authMiddleware := auth.Middleware(s.cfg.Auth.JWTSecret, s.db)
 	adminMiddleware := auth.RequireRole(database.RoleAdmin)
 
 	// Public routes
@@ -72,9 +73,16 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/auth/register", authHandler.Register)
 	mux.HandleFunc("POST /api/v1/auth/login", authHandler.Login)
 
-	// Authenticated routes
+	// User self-service authenticated routes
 	mux.Handle("GET /api/v1/auth/me", authMiddleware(http.HandlerFunc(authHandler.Me)))
+	mux.Handle("GET /api/v1/user/profile", authMiddleware(http.HandlerFunc(userHandler.GetProfile)))
+	mux.Handle("PUT /api/v1/user/profile", authMiddleware(http.HandlerFunc(userHandler.UpdateProfile)))
+	mux.Handle("POST /api/v1/user/regen-key", authMiddleware(http.HandlerFunc(userHandler.RegenerateAPIKey)))
+	mux.Handle("GET /api/v1/user/devices", authMiddleware(http.HandlerFunc(userHandler.ListDevices)))
+	mux.Handle("POST /api/v1/user/devices", authMiddleware(http.HandlerFunc(userHandler.SaveDevice)))
+	mux.Handle("DELETE /api/v1/user/devices/{id}", authMiddleware(http.HandlerFunc(userHandler.DeleteDevice)))
 
+	// Multi-tenant file storage routes
 	mux.Handle("GET /api/v1/storage/status", authMiddleware(http.HandlerFunc(storageHandler.Status)))
 	mux.Handle("GET /api/v1/storage/files", authMiddleware(http.HandlerFunc(storageHandler.ListFiles)))
 	mux.Handle("POST /api/v1/storage/upload", authMiddleware(http.HandlerFunc(storageHandler.Upload)))
@@ -82,11 +90,17 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/v1/storage/mkdir", authMiddleware(http.HandlerFunc(storageHandler.Mkdir)))
 	mux.Handle("DELETE /api/v1/storage/delete", authMiddleware(http.HandlerFunc(storageHandler.Delete)))
 
-	// Admin routes
+	// Admin-only routes
 	mux.Handle("GET /api/v1/admin/users", authMiddleware(adminMiddleware(http.HandlerFunc(adminHandler.ListUsers))))
+	mux.Handle("POST /api/v1/admin/users", authMiddleware(adminMiddleware(http.HandlerFunc(adminHandler.CreateUser))))
+	mux.Handle("PUT /api/v1/admin/users/{id}", authMiddleware(adminMiddleware(http.HandlerFunc(adminHandler.UpdateUser))))
+	mux.Handle("DELETE /api/v1/admin/users/{id}", authMiddleware(adminMiddleware(http.HandlerFunc(adminHandler.DeleteUser))))
+	mux.Handle("POST /api/v1/admin/users/{id}/regen-key", authMiddleware(adminMiddleware(http.HandlerFunc(adminHandler.RegenerateAPIKey))))
+	mux.Handle("GET /api/v1/admin/settings", authMiddleware(adminMiddleware(http.HandlerFunc(adminHandler.GetSettings))))
+	mux.Handle("POST /api/v1/admin/settings", authMiddleware(adminMiddleware(http.HandlerFunc(adminHandler.UpdateSettings))))
 	mux.Handle("GET /api/v1/admin/system", authMiddleware(adminMiddleware(http.HandlerFunc(adminHandler.SystemHealth))))
 
-	// reTerminal E1001 OpenDisplay Routes (public endpoints so reTerminal can fetch without complex certs, or token-authenticated)
+	// reTerminal E1001 OpenDisplay endpoints
 	s.displaySvc.RegisterRoutes(mux)
 }
 
@@ -107,7 +121,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

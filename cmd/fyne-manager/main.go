@@ -1,12 +1,15 @@
 package main
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"image"
 	"image/color"
-	"os"
-	"path/filepath"
+	_ "image/png"
+	"io"
+	"mime/multipart"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -18,29 +21,26 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-	"gopkg.in/yaml.v3"
 
 	"github.com/neonphnx/NeonServices/internal/config"
+	"github.com/neonphnx/NeonServices/internal/database"
 	"github.com/neonphnx/NeonServices/internal/sshutil"
 )
 
 type ManagerApp struct {
-	// reTerminal Display Fields
-	displayDeviceIDEntry      *widget.Entry
-	displayUserIDEntry        *widget.Entry
-	displayCityEntry          *widget.Entry
-	displayLatEntry           *widget.Entry
-	displayLonEntry           *widget.Entry
-	displayTimezoneEntry      *widget.Entry
-	displayCalURLEntry        *widget.Entry
-	displayFullRefreshEntry   *widget.Entry
-	displayPartialRefreshEntry *widget.Entry
-	displayUrlLabel           *widget.Label
+	window     fyne.Window
+	httpClient *http.Client
+	sshClient  *sshutil.Client
 
-	window    fyne.Window
-	sshClient *sshutil.Client
+	// Session State
+	apiBaseURL      string
+	authToken       string
+	currentUser     *database.User
+	userStatusLabel *widget.Label
+	loginBtn        *widget.Button
+	logoutBtn       *widget.Button
 
-	// Connection inputs
+	// SSH Connection inputs
 	hostEntry *widget.Entry
 	portEntry *widget.Entry
 	userEntry *widget.Entry
@@ -48,375 +48,350 @@ type ManagerApp struct {
 	passEntry *widget.Entry
 	connLabel *widget.Label
 
-	// Config inputs
-	jwtSecretEntry *widget.Entry
-	serverPortEntry *widget.Entry
-	dbPathEntry    *widget.Entry
-	nasMountEntry  *widget.Entry
-	quotaGBEntry   *widget.Entry
-	uploadMBEntry  *widget.Entry
-	rawConfigEntry *widget.Entry
-
 	// Service controls
 	serviceStatusLabel *widget.Label
 	logsEntry          *widget.Entry
 
 	// NAS Monitor
 	nasStatusText *widget.Label
+
+	// My Profile
+	profileInfoLabel *widget.Label
+	apiKeyEntry      *widget.Entry
+
+	// User Devices Management (reTerminal E1001)
+	deviceSelect               *widget.Select
+	displayDeviceIDEntry       *widget.Entry
+	displayCityEntry           *widget.Entry
+	displayLatEntry            *widget.Entry
+	displayLonEntry            *widget.Entry
+	displayTimezoneEntry       *widget.Entry
+	displayCalURLEntry         *widget.Entry
+	displayFullRefreshEntry    *widget.Entry
+	displayPartialRefreshEntry *widget.Entry
+	displayUrlLabel            *widget.Label
+
+	// User Data / Cloud Files
+	storageUsageLabel  *widget.Label
+	filesListContainer *fyne.Container
+
+	// Admin User Management
+	usersTableContainer *fyne.Container
+
+	// Admin System Settings
+	mountPathEntry    *widget.Entry
+	settingsPortEntry *widget.Entry
+	quotaEntry        *widget.Entry
+	uploadEntry       *widget.Entry
+	allowRegCheck     *widget.Check
+	healthStatusLabel *widget.Label
+
+	// Main Tabs container
+	tabs *container.AppTabs
 }
 
 func main() {
 	a := app.NewWithID("com.neonservices.manager")
-	w := a.NewWindow("NeonServices Control Center & Secrets Manager")
-	w.Resize(fyne.NewSize(960, 680))
+	w := a.NewWindow("NeonServices Control Center")
+	w.Resize(fyne.NewSize(1080, 760))
 
-	m := &ManagerApp{window: w}
+	m := &ManagerApp{
+		window:     w,
+		httpClient: &http.Client{Timeout: 15 * time.Second},
+		apiBaseURL: "http://192.168.3.54:8080",
+	}
+
 	w.SetContent(m.buildUI())
 	w.ShowAndRun()
 }
 
 func (m *ManagerApp) buildUI() fyne.CanvasObject {
-	tabs := container.NewAppTabs(
-		container.NewTabItemWithIcon("SSH Connection", theme.ComputerIcon(), m.buildConnectionTab()),
-		container.NewTabItemWithIcon("Secrets & Config", theme.DocumentCreateIcon(), m.buildConfigTab()),
-		container.NewTabItemWithIcon("Service & Logs", theme.ViewRefreshIcon(), m.buildServiceTab()),
-		container.NewTabItemWithIcon("NAS & Storage", theme.StorageIcon(), m.buildNASTab()),
-		container.NewTabItemWithIcon("reTerminal E1001", theme.VisibilityIcon(), m.buildDisplayTab()),
-	)
-	tabs.SetTabLocation(container.TabLocationTop)
+	m.userStatusLabel = widget.NewLabel("Status: Logged Out (Public Guest)")
+	m.loginBtn = widget.NewButtonWithIcon("Log In", theme.LoginIcon(), func() {
+		m.showLoginDialog()
+	})
+	m.logoutBtn = widget.NewButtonWithIcon("Log Out", theme.LogoutIcon(), func() {
+		m.logout()
+	})
+	m.logoutBtn.Hide()
 
-	header := container.NewHBox(
-		canvas.NewText("  NEON SERVICES - Remote Manager", color.NRGBA{R: 0, G: 200, B: 255, A: 255}),
-		widget.NewLabel(" | Ubuntu & StationPC PocketCloud Controller"),
+	brandText := canvas.NewText("⚡ NEON SERVICES", color.NRGBA{R: 0, G: 215, B: 255, A: 255})
+	brandText.TextSize = 16
+	brandText.TextStyle = fyne.TextStyle{Bold: true}
+
+	topBar := container.NewBorder(
+		nil, nil,
+		container.NewHBox(brandText, widget.NewLabel(" | Enterprise NAS & Device Hub")),
+		container.NewHBox(m.userStatusLabel, m.loginBtn, m.logoutBtn),
 	)
 
-	return container.NewBorder(header, nil, nil, nil, tabs)
+	m.tabs = container.NewAppTabs(
+		container.NewTabItemWithIcon("My Profile", theme.AccountIcon(), m.buildProfileTab()),
+		container.NewTabItemWithIcon("My Devices", theme.VisibilityIcon(), m.buildDeviceTab()),
+		container.NewTabItemWithIcon("My Cloud Files", theme.FolderIcon(), m.buildUserDataTab()),
+		container.NewTabItemWithIcon("User Management (Admin)", theme.ListIcon(), m.buildUsersTab()),
+		container.NewTabItemWithIcon("System Settings (Admin)", theme.SettingsIcon(), m.buildSettingsTab()),
+		container.NewTabItemWithIcon("SSH & Host Service", theme.ComputerIcon(), m.buildServiceTab()),
+		container.NewTabItemWithIcon("NAS Mount", theme.StorageIcon(), m.buildNASTab()),
+	)
+	m.tabs.SetTabLocation(container.TabLocationTop)
+
+	return container.NewBorder(
+		container.NewVBox(topBar, widget.NewSeparator()),
+		nil, nil, nil,
+		m.tabs,
+	)
 }
 
-func (m *ManagerApp) buildConnectionTab() fyne.CanvasObject {
-	m.hostEntry = widget.NewEntry()
-	m.hostEntry.SetText("192.168.1.100")
+// ==============================================================================
+// Authentication & Session
+// ==============================================================================
 
-	m.portEntry = widget.NewEntry()
-	m.portEntry.SetText("22")
+func (m *ManagerApp) showLoginDialog() {
+	userEntry := widget.NewEntry()
+	userEntry.SetPlaceHolder("admin or your username")
+	passEntry := widget.NewPasswordEntry()
+	passEntry.SetPlaceHolder("password")
+	urlEntry := widget.NewEntry()
+	urlEntry.SetText(m.apiBaseURL)
 
-	m.userEntry = widget.NewEntry()
-	m.userEntry.SetText("ubuntu")
-
-	defaultKey := filepath.Join(os.Getenv("HOME"), ".ssh", "id_ed25519")
-	if _, err := os.Stat(defaultKey); os.IsNotExist(err) {
-		defaultKey = filepath.Join(os.Getenv("HOME"), ".ssh", "id_rsa")
-	}
-	m.keyEntry = widget.NewEntry()
-	m.keyEntry.SetText(defaultKey)
-
-	m.passEntry = widget.NewPasswordEntry()
-	m.passEntry.SetPlaceHolder("(Optional if using SSH key)")
-
-	m.connLabel = widget.NewLabel("Status: Disconnected")
-
-	connectBtn := widget.NewButtonWithIcon("Connect to Server", theme.LoginIcon(), func() {
-		m.connectSSH()
-	})
-	connectBtn.Importance = widget.HighImportance
-
-	disconnectBtn := widget.NewButtonWithIcon("Disconnect", theme.LogoutIcon(), func() {
-		if m.sshClient != nil {
-			_ = m.sshClient.Close()
-			m.sshClient = nil
-			m.connLabel.SetText("Status: Disconnected")
-			dialog.ShowInformation("Disconnected", "SSH session closed", m.window)
-		}
-	})
-
-	form := widget.NewForm(
-		widget.NewFormItem("Ubuntu Machine Host / IP", m.hostEntry),
-		widget.NewFormItem("SSH Port", m.portEntry),
-		widget.NewFormItem("SSH Username", m.userEntry),
-		widget.NewFormItem("Private Key Path", m.keyEntry),
-		widget.NewFormItem("Password (Alternative)", m.passEntry),
-	)
-
-	btnRow := container.NewHBox(connectBtn, disconnectBtn, m.connLabel)
-	desc := widget.NewLabel("Connect directly to your Ubuntu host running NeonServices and attached StationPC PocketCloud NAS.")
-	desc.Wrapping = fyne.TextWrapWord
-
-	return container.NewVBox(desc, form, btnRow)
-}
-
-func (m *ManagerApp) connectSSH() {
-	port, err := strconv.Atoi(m.portEntry.Text)
-	if err != nil {
-		port = 22
+	items := []*widget.FormItem{
+		widget.NewFormItem("Server API URL", urlEntry),
+		widget.NewFormItem("Username", userEntry),
+		widget.NewFormItem("Password", passEntry),
 	}
 
-	opts := sshutil.Options{
-		Host:     strings.TrimSpace(m.hostEntry.Text),
-		Port:     port,
-		User:     strings.TrimSpace(m.userEntry.Text),
-		KeyPath:  strings.TrimSpace(m.keyEntry.Text),
-		Password: m.passEntry.Text,
-		Timeout:  8 * time.Second,
-	}
-
-	if m.sshClient != nil {
-		_ = m.sshClient.Close()
-	}
-
-	client := sshutil.NewClient(opts)
-	m.connLabel.SetText("Status: Connecting...")
-
-	go func() {
-		err := client.Connect()
-		if err != nil {
-			m.window.Canvas().Refresh(m.connLabel)
-			m.connLabel.SetText("Status: Connection Failed")
-			dialog.ShowError(fmt.Errorf("SSH connection failed: %w", err), m.window)
+	dialog.ShowForm("Log In to NeonServices", "Login", "Cancel", items, func(confirmed bool) {
+		if !confirmed || userEntry.Text == "" || passEntry.Text == "" {
 			return
 		}
-		m.sshClient = client
-		out, _ := client.Run("uname -a && uptime")
-		m.connLabel.SetText("Status: Connected to " + opts.Host)
-		dialog.ShowInformation("Connected", fmt.Sprintf("Successfully connected to Ubuntu host!\n\n%s", out), m.window)
-	}()
+		m.apiBaseURL = strings.TrimRight(urlEntry.Text, "/")
+
+		go func() {
+			payload := map[string]string{
+				"username": userEntry.Text,
+				"password": passEntry.Text,
+			}
+			bodyBytes, _ := json.Marshal(payload)
+			resp, err := m.httpClient.Post(m.apiBaseURL+"/api/v1/auth/login", "application/json", bytes.NewReader(bodyBytes))
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("Failed to connect to %s: %v", m.apiBaseURL, err), m.window)
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				data, _ := io.ReadAll(resp.Body)
+				dialog.ShowError(fmt.Errorf("Login failed: %s", string(data)), m.window)
+				return
+			}
+
+			var authRes struct {
+				Success bool `json:"success"`
+				Data    struct {
+					Token string         `json:"token"`
+					User  *database.User `json:"user"`
+				} `json:"data"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&authRes); err != nil || authRes.Data.User == nil {
+				dialog.ShowError(fmt.Errorf("Failed to parse server response"), m.window)
+				return
+			}
+
+			m.authToken = authRes.Data.Token
+			m.currentUser = authRes.Data.User
+
+			m.userStatusLabel.SetText(fmt.Sprintf("Logged in: %s (%s)", m.currentUser.Username, strings.ToUpper(string(m.currentUser.Role))))
+			m.loginBtn.Hide()
+			m.logoutBtn.Show()
+
+			// Refresh all user tabs
+			m.refreshProfileView()
+			m.refreshDeviceList()
+			m.refreshUserFiles()
+			if m.currentUser.Role == database.RoleAdmin {
+				m.refreshUsersList()
+			}
+
+			dialog.ShowInformation("Welcome", fmt.Sprintf("Successfully logged in as %s (%s)", m.currentUser.Username, m.currentUser.Role), m.window)
+		}()
+	}, m.window)
 }
 
-func (m *ManagerApp) buildConfigTab() fyne.CanvasObject {
-	m.serverPortEntry = widget.NewEntry()
-	m.serverPortEntry.SetText("8080")
+func (m *ManagerApp) logout() {
+	m.authToken = ""
+	m.currentUser = nil
+	m.userStatusLabel.SetText("Status: Logged Out (Public Guest)")
+	m.loginBtn.Show()
+	m.logoutBtn.Hide()
+	m.profileInfoLabel.SetText("Please log in to view your profile and credentials.")
+	m.apiKeyEntry.SetText("")
+	m.filesListContainer.Objects = nil
+	m.filesListContainer.Refresh()
+	m.storageUsageLabel.SetText("Storage: Not logged in")
+	if m.usersTableContainer != nil {
+		m.usersTableContainer.Objects = nil
+		m.usersTableContainer.Refresh()
+	}
+	dialog.ShowInformation("Logged Out", "You have been logged out successfully.", m.window)
+}
 
-	m.jwtSecretEntry = widget.NewEntry()
-	m.jwtSecretEntry.SetText("super-secret-jwt-key-replace-me")
+// ==============================================================================
+// My Profile & Personal API Key
+// ==============================================================================
 
-	genSecretBtn := widget.NewButtonWithIcon("Generate Secure Key", theme.ContentAddIcon(), func() {
-		b := make([]byte, 32)
-		_, _ = rand.Read(b)
-		m.jwtSecretEntry.SetText(hex.EncodeToString(b))
+func (m *ManagerApp) buildProfileTab() fyne.CanvasObject {
+	m.profileInfoLabel = widget.NewLabel("Please log in using the 'Log In' button in the top right.")
+	m.profileInfoLabel.Wrapping = fyne.TextWrapWord
+
+	m.apiKeyEntry = widget.NewEntry()
+	m.apiKeyEntry.SetPlaceHolder("Your API key will appear here after logging in")
+
+	copyKeyBtn := widget.NewButtonWithIcon("Copy API Key", theme.ContentCopyIcon(), func() {
+		if m.apiKeyEntry.Text != "" {
+			m.window.Clipboard().SetContent(m.apiKeyEntry.Text)
+			dialog.ShowInformation("Copied", "API key copied to clipboard!", m.window)
+		}
 	})
 
-	m.dbPathEntry = widget.NewEntry()
-	m.dbPathEntry.SetText("/var/lib/neonservices/neonservices.db")
-
-	m.nasMountEntry = widget.NewEntry()
-	m.nasMountEntry.SetText("/mnt/pocketcloud/storage")
-
-	m.quotaGBEntry = widget.NewEntry()
-	m.quotaGBEntry.SetText("50")
-
-	m.uploadMBEntry = widget.NewEntry()
-	m.uploadMBEntry.SetText("2048")
-
-	m.rawConfigEntry = widget.NewMultiLineEntry()
-	m.rawConfigEntry.Wrapping = fyne.TextWrapWord
-	m.rawConfigEntry.SetMinRowsVisible(8)
-
-	fetchBtn := widget.NewButtonWithIcon("Pull Remote Config", theme.DownloadIcon(), func() {
-		m.fetchRemoteConfig()
+	regenKeyBtn := widget.NewButtonWithIcon("Regenerate Key", theme.ViewRefreshIcon(), func() {
+		m.regenerateMyAPIKey()
 	})
 
-	deployBtn := widget.NewButtonWithIcon("Push Config & Secrets via SSH", theme.UploadIcon(), func() {
-		m.pushConfigSSH()
+	keyRow := container.NewBorder(nil, nil, nil, container.NewHBox(copyKeyBtn, regenKeyBtn), m.apiKeyEntry)
+
+	changePassBtn := widget.NewButtonWithIcon("Change My Password", theme.DocumentCreateIcon(), func() {
+		m.showChangePasswordDialog()
 	})
-	deployBtn.Importance = widget.HighImportance
-
-	secretRow := container.NewBorder(nil, nil, nil, genSecretBtn, m.jwtSecretEntry)
-
-	form := widget.NewForm(
-		widget.NewFormItem("Server Port", m.serverPortEntry),
-		widget.NewFormItem("JWT Secret Key", secretRow),
-		widget.NewFormItem("SQLite DB Path", m.dbPathEntry),
-		widget.NewFormItem("NAS Base Mount Path", m.nasMountEntry),
-		widget.NewFormItem("Default User Quota (GB)", m.quotaGBEntry),
-		widget.NewFormItem("Max Upload Size (MB)", m.uploadMBEntry),
-	)
-
-	btnRow := container.NewHBox(fetchBtn, deployBtn)
 
 	return container.NewVBox(
-		widget.NewLabel("Configure environment, secrets, and NAS storage mount parameters:"),
-		form,
-		btnRow,
-		widget.NewLabel("YAML Preview / Manual Adjustments:"),
-		container.NewHScroll(m.rawConfigEntry),
+		widget.NewLabelWithStyle("User Profile & Authentication", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		m.profileInfoLabel,
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Personal API Key (for CLI, Python scripts, & Display devices):", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		keyRow,
+		widget.NewSeparator(),
+		container.NewHBox(changePassBtn),
 	)
 }
 
-func (m *ManagerApp) fetchRemoteConfig() {
-	if m.sshClient == nil {
-		dialog.ShowInformation("Not Connected", "Please connect to the Ubuntu host via the SSH tab first.", m.window)
+func (m *ManagerApp) refreshProfileView() {
+	if m.currentUser == nil {
 		return
 	}
-
-	remotePath := "/opt/neonservices/config.yaml"
-	go func() {
-		data, err := m.sshClient.DownloadContent(remotePath)
-		if err != nil {
-			dialog.ShowError(fmt.Errorf("Failed to read %s: %w", remotePath, err), m.window)
-			return
-		}
-
-		var cfg config.Config
-		if err := yaml.Unmarshal(data, &cfg); err == nil {
-			m.serverPortEntry.SetText(fmt.Sprintf("%d", cfg.Server.Port))
-			m.jwtSecretEntry.SetText(cfg.Auth.JWTSecret)
-			m.dbPathEntry.SetText(cfg.Database.Path)
-			m.nasMountEntry.SetText(cfg.Storage.BaseMountPath)
-			m.quotaGBEntry.SetText(fmt.Sprintf("%d", cfg.Storage.DefaultQuotaBytes/(1024*1024*1024)))
-			m.uploadMBEntry.SetText(fmt.Sprintf("%d", cfg.Storage.MaxUploadSizeMB))
-		}
-		m.rawConfigEntry.SetText(string(data))
-		dialog.ShowInformation("Success", "Remote configuration loaded successfully!", m.window)
-	}()
+	quotaMB := float64(m.currentUser.QuotaBytes) / (1024 * 1024)
+	usedMB := float64(m.currentUser.StorageUsedBytes) / (1024 * 1024)
+	percent := 0.0
+	if quotaMB > 0 {
+		percent = (usedMB / quotaMB) * 100.0
+	}
+	info := fmt.Sprintf("Username: %s\nEmail: %s\nRole: %s\nStorage Quota: %.2f MB used of %.2f MB (%.1f%%)\nUser ID: %d\nAccount Created: %s",
+		m.currentUser.Username, m.currentUser.Email, m.currentUser.Role,
+		usedMB, quotaMB, percent, m.currentUser.ID, m.currentUser.CreatedAt.Format(time.RFC822))
+	m.profileInfoLabel.SetText(info)
+	m.apiKeyEntry.SetText(m.currentUser.APIKey)
 }
 
-func (m *ManagerApp) pushConfigSSH() {
-	if m.sshClient == nil {
-		dialog.ShowInformation("Not Connected", "Please connect to the Ubuntu host via the SSH tab first.", m.window)
+func (m *ManagerApp) regenerateMyAPIKey() {
+	if m.authToken == "" {
+		dialog.ShowInformation("Login Required", "Please log in first.", m.window)
 		return
 	}
-
-	port, _ := strconv.Atoi(m.serverPortEntry.Text)
-	if port <= 0 {
-		port = 8080
-	}
-	quotaGB, _ := strconv.ParseInt(m.quotaGBEntry.Text, 10, 64)
-	if quotaGB <= 0 {
-		quotaGB = 50
-	}
-	uploadMB, _ := strconv.ParseInt(m.uploadMBEntry.Text, 10, 64)
-	if uploadMB <= 0 {
-		uploadMB = 2048
-	}
-
-	cfg := config.DefaultConfig()
-	cfg.Server.Port = port
-	cfg.Auth.JWTSecret = m.jwtSecretEntry.Text
-	cfg.Database.Path = m.dbPathEntry.Text
-	cfg.Storage.BaseMountPath = m.nasMountEntry.Text
-	cfg.Storage.DefaultQuotaBytes = quotaGB * 1024 * 1024 * 1024
-	cfg.Storage.MaxUploadSizeMB = uploadMB
-
-	yamlBytes, err := yaml.Marshal(cfg)
-	if err != nil {
-		dialog.ShowError(err, m.window)
-		return
-	}
-
-	m.rawConfigEntry.SetText(string(yamlBytes))
-
-	remotePath := "/opt/neonservices/config.yaml"
-	go func() {
-		err := m.sshClient.UploadContent(remotePath, yamlBytes, 0600)
-		if err != nil {
-			dialog.ShowError(fmt.Errorf("Failed to upload config to %s: %w", remotePath, err), m.window)
-			return
-		}
-		dialog.ShowInformation("Configuration Deployed",
-			fmt.Sprintf("Successfully pushed configuration to %s (permissions 0600).\nRestart the service to apply changes.", remotePath),
-			m.window,
-		)
-	}()
-}
-
-func (m *ManagerApp) buildServiceTab() fyne.CanvasObject {
-	m.serviceStatusLabel = widget.NewLabel("Service Status: Unknown")
-	m.logsEntry = widget.NewMultiLineEntry()
-	m.logsEntry.SetMinRowsVisible(14)
-	m.logsEntry.Wrapping = fyne.TextWrapWord
-
-	statusBtn := widget.NewButtonWithIcon("Check Status", theme.InfoIcon(), func() {
-		m.refreshStatus()
-	})
-
-	restartBtn := widget.NewButtonWithIcon("Restart Service", theme.ViewRefreshIcon(), func() {
-		if m.sshClient == nil {
-			dialog.ShowInformation("Not Connected", "Please connect to SSH first.", m.window)
+	dialog.ShowConfirm("Regenerate API Key", "Are you sure? Any external device or script using your existing key will lose access immediately.", func(confirmed bool) {
+		if !confirmed {
 			return
 		}
 		go func() {
-			out, err := m.sshClient.RestartService("neonservices")
-			if err != nil {
-				dialog.ShowError(fmt.Errorf("Restart error: %v\nOutput: %s", err, out), m.window)
-			} else {
-				dialog.ShowInformation("Service Restarted", "neonservices restarted successfully.", m.window)
-				m.refreshStatus()
-			}
-		}()
-	})
-
-	logsBtn := widget.NewButtonWithIcon("Fetch Live Logs", theme.DocumentIcon(), func() {
-		if m.sshClient == nil {
-			dialog.ShowInformation("Not Connected", "Please connect to SSH first.", m.window)
-			return
-		}
-		go func() {
-			logs, err := m.sshClient.ServiceLogs("neonservices", 100)
+			req, _ := http.NewRequest("POST", m.apiBaseURL+"/api/v1/user/apikey/regenerate", nil)
+			req.Header.Set("Authorization", "Bearer "+m.authToken)
+			resp, err := m.httpClient.Do(req)
 			if err != nil {
 				dialog.ShowError(err, m.window)
 				return
 			}
-			m.logsEntry.SetText(logs)
+			defer resp.Body.Close()
+
+			var res struct {
+				Data struct {
+					APIKey string `json:"api_key"`
+				} `json:"data"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&res); err == nil && res.Data.APIKey != "" {
+				m.currentUser.APIKey = res.Data.APIKey
+				m.apiKeyEntry.SetText(res.Data.APIKey)
+				dialog.ShowInformation("Key Regenerated", "Your new API key has been created and updated!", m.window)
+			}
 		}()
-	})
-
-	btnRow := container.NewHBox(statusBtn, restartBtn, logsBtn, m.serviceStatusLabel)
-
-	return container.NewBorder(
-		container.NewVBox(widget.NewLabel("Ubuntu Systemd Service Management:"), btnRow),
-		nil, nil, nil,
-		container.NewVScroll(m.logsEntry),
-	)
+	}, m.window)
 }
 
-func (m *ManagerApp) refreshStatus() {
-	if m.sshClient == nil {
-		dialog.ShowInformation("Not Connected", "Please connect to SSH first.", m.window)
+func (m *ManagerApp) showChangePasswordDialog() {
+	if m.authToken == "" {
+		dialog.ShowInformation("Login Required", "Please log in first.", m.window)
 		return
 	}
-	go func() {
-		status, isActive, _ := m.sshClient.ServiceStatus("neonservices")
-		if isActive {
-			m.serviceStatusLabel.SetText("Service Status: ACTIVE (running)")
-		} else {
-			m.serviceStatusLabel.SetText("Service Status: " + status)
+	oldPassEntry := widget.NewPasswordEntry()
+	newPassEntry := widget.NewPasswordEntry()
+	confirmPassEntry := widget.NewPasswordEntry()
+
+	items := []*widget.FormItem{
+		widget.NewFormItem("Current Password", oldPassEntry),
+		widget.NewFormItem("New Password", newPassEntry),
+		widget.NewFormItem("Confirm Password", confirmPassEntry),
+	}
+
+	dialog.ShowForm("Change Password", "Update", "Cancel", items, func(confirmed bool) {
+		if !confirmed {
+			return
 		}
-	}()
-}
-
-func (m *ManagerApp) buildNASTab() fyne.CanvasObject {
-	m.nasStatusText = widget.NewLabel("NAS Status: Not queried. Connect via SSH to inspect.")
-	m.nasStatusText.Wrapping = fyne.TextWrapWord
-
-	inspectBtn := widget.NewButtonWithIcon("Inspect NAS & Filesystem", theme.SearchIcon(), func() {
-		if m.sshClient == nil {
-			dialog.ShowInformation("Not Connected", "Please connect to SSH first.", m.window)
+		if newPassEntry.Text != confirmPassEntry.Text {
+			dialog.ShowError(fmt.Errorf("New passwords do not match"), m.window)
+			return
+		}
+		if len(newPassEntry.Text) < 8 {
+			dialog.ShowError(fmt.Errorf("New password must be at least 8 characters"), m.window)
 			return
 		}
 		go func() {
-			mountPath := m.nasMountEntry.Text
-			cmd := fmt.Sprintf("df -h %s && ls -la %s 2>&1", mountPath, mountPath)
-			out, err := m.sshClient.Run(cmd)
+			payload := map[string]string{
+				"old_password": oldPassEntry.Text,
+				"new_password": newPassEntry.Text,
+			}
+			b, _ := json.Marshal(payload)
+			req, _ := http.NewRequest("PUT", m.apiBaseURL+"/api/v1/user/profile", bytes.NewReader(b))
+			req.Header.Set("Authorization", "Bearer "+m.authToken)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := m.httpClient.Do(req)
 			if err != nil {
-				m.nasStatusText.SetText(fmt.Sprintf("Failed or unmounted:\n%s\n%v", out, err))
+				dialog.ShowError(err, m.window)
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				dialog.ShowInformation("Success", "Password updated successfully!", m.window)
 			} else {
-				m.nasStatusText.SetText(fmt.Sprintf("StationPC PocketCloud NAS Storage Status:\n\n%s", out))
+				data, _ := io.ReadAll(resp.Body)
+				dialog.ShowError(fmt.Errorf("Update failed: %s", string(data)), m.window)
 			}
 		}()
-	})
-
-	return container.NewVBox(
-		widget.NewLabel("StationPC PocketCloud NAS Storage Mount Overview:"),
-		inspectBtn,
-		m.nasStatusText,
-	)
+	}, m.window)
 }
 
-func (m *ManagerApp) buildDisplayTab() fyne.CanvasObject {
+// ==============================================================================
+// My Devices (reTerminal E1001 / OpenDisplay)
+// ==============================================================================
+
+func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
+	m.deviceSelect = widget.NewSelect([]string{"reterminal-01"}, func(s string) {
+		if s != "" && s != "(New Device)" {
+			m.displayDeviceIDEntry.SetText(s)
+			m.fetchDisplayConfigFor(s)
+		}
+	})
+	m.deviceSelect.SetSelected("reterminal-01")
+
 	m.displayDeviceIDEntry = widget.NewEntry()
 	m.displayDeviceIDEntry.SetText("reterminal-01")
-
-	m.displayUserIDEntry = widget.NewEntry()
-	m.displayUserIDEntry.SetText("1")
 
 	m.displayCityEntry = widget.NewEntry()
 	m.displayCityEntry.SetText("New York, NY")
@@ -439,145 +414,1036 @@ func (m *ManagerApp) buildDisplayTab() fyne.CanvasObject {
 	m.displayPartialRefreshEntry = widget.NewEntry()
 	m.displayPartialRefreshEntry.SetText("1")
 
-	m.displayUrlLabel = widget.NewLabel("reTerminal Target URL: http://" + m.hostEntry.Text + ":8080/api/v1/display/reterminal-01/image.png")
+	m.displayUrlLabel = widget.NewLabel("reTerminal OpenDisplay URL: " + m.apiBaseURL + "/api/v1/display/reterminal-01/image.png")
 	m.displayUrlLabel.Wrapping = fyne.TextWrapWord
 
 	m.displayDeviceIDEntry.OnChanged = func(s string) {
-		m.displayUrlLabel.SetText("reTerminal Target URL: http://" + m.hostEntry.Text + ":8080/api/v1/display/" + s + "/image.png")
+		m.displayUrlLabel.SetText("reTerminal OpenDisplay URL: " + m.apiBaseURL + "/api/v1/display/" + s + "/image.png")
 	}
 
-	saveBtn := widget.NewButtonWithIcon("Save & Push to reTerminal", theme.DocumentSaveIcon(), func() {
-		m.saveDisplayConfig()
+	saveBtn := widget.NewButtonWithIcon("Save Device Config", theme.DocumentSaveIcon(), func() {
+		m.saveDisplayDevice()
 	})
 	saveBtn.Importance = widget.HighImportance
 
-	fetchBtn := widget.NewButtonWithIcon("Fetch Current Config", theme.DownloadIcon(), func() {
-		m.fetchDisplayConfig()
+	deleteDeviceBtn := widget.NewButtonWithIcon("Delete Device", theme.DeleteIcon(), func() {
+		m.deleteCurrentDevice()
+	})
+	deleteDeviceBtn.Importance = widget.DangerImportance
+
+	refreshDevicesBtn := widget.NewButtonWithIcon("Refresh List", theme.ViewRefreshIcon(), func() {
+		m.refreshDeviceList()
 	})
 
-	previewBtn := widget.NewButtonWithIcon("Preview 800x480 Layout", theme.VisibilityIcon(), func() {
+	previewBtn := widget.NewButtonWithIcon("Preview 800x480 e-Paper", theme.MediaPlayIcon(), func() {
 		m.previewDisplay()
 	})
 
-	addEventBtn := widget.NewButtonWithIcon("Add Calendar Event", theme.ContentAddIcon(), func() {
+	addEventBtn := widget.NewButtonWithIcon("Add Quick Event", theme.ContentAddIcon(), func() {
 		m.showAddEventDialog()
 	})
 
 	form := widget.NewForm(
-		widget.NewFormItem("Device ID", m.displayDeviceIDEntry),
-		widget.NewFormItem("Associated User ID", m.displayUserIDEntry),
-		widget.NewFormItem("City / Location Name", m.displayCityEntry),
+		widget.NewFormItem("Device Identifier", m.displayDeviceIDEntry),
+		widget.NewFormItem("City Name", m.displayCityEntry),
 		widget.NewFormItem("Latitude", m.displayLatEntry),
 		widget.NewFormItem("Longitude", m.displayLonEntry),
 		widget.NewFormItem("Timezone", m.displayTimezoneEntry),
-		widget.NewFormItem("iCal Calendar Feed URL", m.displayCalURLEntry),
-		widget.NewFormItem("Full Refresh Interval (Minutes)", m.displayFullRefreshEntry),
-		widget.NewFormItem("Partial Refresh Interval (Minutes)", m.displayPartialRefreshEntry),
+		widget.NewFormItem("iCal Calendar URL", m.displayCalURLEntry),
+		widget.NewFormItem("Full Refresh (minutes)", m.displayFullRefreshEntry),
+		widget.NewFormItem("Partial Refresh (minutes)", m.displayPartialRefreshEntry),
 	)
 
-	btnRow := container.NewHBox(saveBtn, fetchBtn, previewBtn, addEventBtn)
+	topSelectorRow := container.NewHBox(
+		widget.NewLabelWithStyle("My Devices:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		m.deviceSelect,
+		refreshDevicesBtn,
+		deleteDeviceBtn,
+	)
 
-	headerDesc := widget.NewLabel("Configure the 7.5-inch 800x480 e-Paper display for Seeed Studio reTerminal E1001 OpenDisplay.")
-	headerDesc.Wrapping = fyne.TextWrapWord
-
-	return container.NewVBox(
-		headerDesc,
-		form,
-		btnRow,
+	return container.NewScroll(container.NewVBox(
+		topSelectorRow,
 		widget.NewSeparator(),
+		form,
+		container.NewHBox(saveBtn, previewBtn, addEventBtn),
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Device Integration Helper:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		m.displayUrlLabel,
-	)
+	))
 }
 
-func (m *ManagerApp) saveDisplayConfig() {
+func (m *ManagerApp) refreshDeviceList() {
+	if m.authToken == "" {
+		return
+	}
+	go func() {
+		req, _ := http.NewRequest("GET", m.apiBaseURL+"/api/v1/user/devices", nil)
+		req.Header.Set("Authorization", "Bearer "+m.authToken)
+		resp, err := m.httpClient.Do(req)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+
+		var res struct {
+			Data []*database.DisplayConfig `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&res); err == nil && len(res.Data) > 0 {
+			var opts []string
+			for _, d := range res.Data {
+				opts = append(opts, d.DeviceID)
+			}
+			opts = append(opts, "(New Device)")
+			m.deviceSelect.Options = opts
+			m.deviceSelect.Refresh()
+		}
+	}()
+}
+
+func (m *ManagerApp) fetchDisplayConfigFor(deviceID string) {
+	go func() {
+		url := fmt.Sprintf("%s/api/v1/display/%s/config", m.apiBaseURL, deviceID)
+		req, _ := http.NewRequest("GET", url, nil)
+		if m.authToken != "" {
+			req.Header.Set("Authorization", "Bearer "+m.authToken)
+		}
+		resp, err := m.httpClient.Do(req)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+
+		var res struct {
+			Data *database.DisplayConfig `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&res); err == nil && res.Data != nil {
+			m.displayDeviceIDEntry.SetText(res.Data.DeviceID)
+			m.displayCityEntry.SetText(res.Data.CityName)
+			m.displayLatEntry.SetText(fmt.Sprintf("%.4f", res.Data.Latitude))
+			m.displayLonEntry.SetText(fmt.Sprintf("%.4f", res.Data.Longitude))
+			m.displayTimezoneEntry.SetText(res.Data.Timezone)
+			m.displayCalURLEntry.SetText(res.Data.CalendarURL)
+			m.displayFullRefreshEntry.SetText(fmt.Sprintf("%d", res.Data.FullRefreshMinutes))
+			m.displayPartialRefreshEntry.SetText(fmt.Sprintf("%d", res.Data.PartialRefreshMinutes))
+		}
+	}()
+}
+
+func (m *ManagerApp) saveDisplayDevice() {
+	if m.authToken == "" {
+		dialog.ShowInformation("Login Required", "Please log in to register and save devices to your account.", m.window)
+		return
+	}
 	lat, _ := strconv.ParseFloat(m.displayLatEntry.Text, 64)
 	lon, _ := strconv.ParseFloat(m.displayLonEntry.Text, 64)
 	fullRef, _ := strconv.Atoi(m.displayFullRefreshEntry.Text)
 	partRef, _ := strconv.Atoi(m.displayPartialRefreshEntry.Text)
-	uid, _ := strconv.ParseInt(m.displayUserIDEntry.Text, 10, 64)
-	if uid <= 0 {
-		uid = 1
+
+	payload := map[string]interface{}{
+		"device_id":               strings.TrimSpace(m.displayDeviceIDEntry.Text),
+		"city_name":               m.displayCityEntry.Text,
+		"latitude":                lat,
+		"longitude":               lon,
+		"timezone":                m.displayTimezoneEntry.Text,
+		"calendar_url":            m.displayCalURLEntry.Text,
+		"full_refresh_minutes":    fullRef,
+		"partial_refresh_minutes": partRef,
 	}
 
-	payload := fmt.Sprintf(`{"user_id":%d,"city_name":%q,"latitude":%f,"longitude":%f,"timezone":%q,"calendar_url":%q,"full_refresh_minutes":%d,"partial_refresh_minutes":%d}`,
-		uid, m.displayCityEntry.Text, lat, lon, m.displayTimezoneEntry.Text, m.displayCalURLEntry.Text, fullRef, partRef,
-	)
-
-	host := m.hostEntry.Text
-	url := fmt.Sprintf("http://%s:8080/api/v1/display/%s/config", host, m.displayDeviceIDEntry.Text)
-
 	go func() {
-		// Use SSH or direct HTTP
-		var cmd string
-		if m.sshClient != nil {
-			cmd = fmt.Sprintf("curl -s -X POST -H 'Content-Type: application/json' -d %q http://127.0.0.1:8080/api/v1/display/%s/config",
-				payload, m.displayDeviceIDEntry.Text)
-			out, err := m.sshClient.Run(cmd)
-			if err != nil {
-				dialog.ShowError(fmt.Errorf("Failed to update config: %v\n%s", err, out), m.window)
-				return
-			}
-		}
-		dialog.ShowInformation("Configuration Updated", fmt.Sprintf("Display config successfully saved for device %q!\nURL: %s", m.displayDeviceIDEntry.Text, url), m.window)
-	}()
-}
-
-func (m *ManagerApp) fetchDisplayConfig() {
-	if m.sshClient == nil {
-		dialog.ShowInformation("Not Connected", "Please connect via SSH first to query the server.", m.window)
-		return
-	}
-	devID := m.displayDeviceIDEntry.Text
-	go func() {
-		cmd := fmt.Sprintf("curl -s http://127.0.0.1:8080/api/v1/display/%s/config", devID)
-		out, err := m.sshClient.Run(cmd)
+		b, _ := json.Marshal(payload)
+		req, _ := http.NewRequest("POST", m.apiBaseURL+"/api/v1/user/devices", bytes.NewReader(b))
+		req.Header.Set("Authorization", "Bearer "+m.authToken)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := m.httpClient.Do(req)
 		if err != nil {
 			dialog.ShowError(err, m.window)
 			return
 		}
-		dialog.ShowInformation("Display Config", out, m.window)
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			dialog.ShowInformation("Device Saved", fmt.Sprintf("Device %q successfully registered to your account!", m.displayDeviceIDEntry.Text), m.window)
+			m.refreshDeviceList()
+		} else {
+			data, _ := io.ReadAll(resp.Body)
+			dialog.ShowError(fmt.Errorf("Failed to save device: %s", string(data)), m.window)
+		}
 	}()
 }
 
-func (m *ManagerApp) previewDisplay() {
-	host := m.hostEntry.Text
-	devID := m.displayDeviceIDEntry.Text
-	url := fmt.Sprintf("http://%s:8080/api/v1/display/%s/image.png", host, devID)
+func (m *ManagerApp) deleteCurrentDevice() {
+	if m.authToken == "" {
+		dialog.ShowInformation("Login Required", "Please log in first.", m.window)
+		return
+	}
+	devID := strings.TrimSpace(m.displayDeviceIDEntry.Text)
+	if devID == "" || devID == "(New Device)" {
+		return
+	}
+	dialog.ShowConfirm("Delete Device", fmt.Sprintf("Are you sure you want to delete device %q?", devID), func(confirmed bool) {
+		if !confirmed {
+			return
+		}
+		go func() {
+			req, _ := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/user/devices/%s", m.apiBaseURL, devID), nil)
+			req.Header.Set("Authorization", "Bearer "+m.authToken)
+			resp, err := m.httpClient.Do(req)
+			if err != nil {
+				dialog.ShowError(err, m.window)
+				return
+			}
+			defer resp.Body.Close()
+			dialog.ShowInformation("Deleted", fmt.Sprintf("Device %q removed.", devID), m.window)
+			m.refreshDeviceList()
+		}()
+	}, m.window)
+}
 
-	dialog.ShowInformation("reTerminal E1001 Preview",
-		fmt.Sprintf("e-Paper Display URL for OpenDisplay:\n\n%s\n\nOpen this in your browser to inspect the rendered 800x480 dashboard.", url),
-		m.window,
-	)
+func (m *ManagerApp) previewDisplay() {
+	go func() {
+		url := fmt.Sprintf("%s/api/v1/display/render?device_id=%s", m.apiBaseURL, m.displayDeviceIDEntry.Text)
+		req, _ := http.NewRequest("GET", url, nil)
+		if m.authToken != "" {
+			req.Header.Set("Authorization", "Bearer "+m.authToken)
+		}
+		resp, err := m.httpClient.Do(req)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("Failed to render preview: %v", err), m.window)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			data, _ := io.ReadAll(resp.Body)
+			dialog.ShowError(fmt.Errorf("Render failed (%d): %s", resp.StatusCode, string(data)), m.window)
+			return
+		}
+
+		img, _, err := image.Decode(resp.Body)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("Failed to decode PNG image: %v", err), m.window)
+			return
+		}
+
+		previewWin := fyne.CurrentApp().NewWindow(fmt.Sprintf("reTerminal Preview (800x480) - %s", m.displayDeviceIDEntry.Text))
+		canvasImg := canvas.NewImageFromImage(img)
+		canvasImg.FillMode = canvas.ImageFillContain
+		canvasImg.SetMinSize(fyne.NewSize(800, 480))
+
+		refreshType := resp.Header.Get("X-Refresh-Type")
+		infoLabel := widget.NewLabel(fmt.Sprintf("Resolution: 800x480 Monochrome | Refresh Mode: %s", strings.ToUpper(refreshType)))
+
+		previewWin.SetContent(container.NewBorder(nil, infoLabel, nil, nil, canvasImg))
+		previewWin.Resize(fyne.NewSize(820, 520))
+		previewWin.Show()
+	}()
 }
 
 func (m *ManagerApp) showAddEventDialog() {
-	devID := m.displayDeviceIDEntry.Text
 	titleEntry := widget.NewEntry()
-	titleEntry.SetPlaceHolder("e.g. Project Demo")
+	titleEntry.SetPlaceHolder("Project Review / Meeting")
 	locEntry := widget.NewEntry()
-	locEntry.SetPlaceHolder("e.g. Lab Office")
+	locEntry.SetPlaceHolder("Office / Zoom")
+	startEntry := widget.NewEntry()
+	startEntry.SetText(time.Now().Add(1 * time.Hour).Format("15:04"))
+	endEntry := widget.NewEntry()
+	endEntry.SetText(time.Now().Add(2 * time.Hour).Format("15:04"))
 
 	items := []*widget.FormItem{
 		widget.NewFormItem("Event Title", titleEntry),
 		widget.NewFormItem("Location", locEntry),
+		widget.NewFormItem("Start Time (HH:MM)", startEntry),
+		widget.NewFormItem("End Time (HH:MM)", endEntry),
 	}
 
-	dialog.ShowForm("Add Calendar Event", "Create Event", "Cancel", items, func(confirmed bool) {
+	dialog.ShowForm("Add Calendar Event to reTerminal", "Add Event", "Cancel", items, func(confirmed bool) {
 		if !confirmed || titleEntry.Text == "" {
 			return
 		}
 		now := time.Now()
-		payload := fmt.Sprintf(`{"title":%q,"start_time":%q,"end_time":%q,"location":%q}`,
-			titleEntry.Text, now.Format(time.RFC3339), now.Add(1*time.Hour).Format(time.RFC3339), locEntry.Text,
-		)
+		st, _ := time.Parse("15:04", startEntry.Text)
+		et, _ := time.Parse("15:04", endEntry.Text)
+		startTime := time.Date(now.Year(), now.Month(), now.Day(), st.Hour(), st.Minute(), 0, 0, time.Local)
+		endTime := time.Date(now.Year(), now.Month(), now.Day(), et.Hour(), et.Minute(), 0, 0, time.Local)
 
-		if m.sshClient != nil {
-			cmd := fmt.Sprintf("curl -s -X POST -H 'Content-Type: application/json' -d %q http://127.0.0.1:8080/api/v1/display/%s/events",
-				payload, devID)
-			go func() {
-				_, _ = m.sshClient.Run(cmd)
-				dialog.ShowInformation("Event Added", "Calendar event created on reTerminal dashboard.", m.window)
-			}()
+		payload := map[string]interface{}{
+			"device_id":  m.displayDeviceIDEntry.Text,
+			"title":      titleEntry.Text,
+			"location":   locEntry.Text,
+			"start_time": startTime.Format(time.RFC3339),
+			"end_time":   endTime.Format(time.RFC3339),
 		}
+
+		go func() {
+			b, _ := json.Marshal(payload)
+			req, _ := http.NewRequest("POST", m.apiBaseURL+"/api/v1/display/events", bytes.NewReader(b))
+			if m.authToken != "" {
+				req.Header.Set("Authorization", "Bearer "+m.authToken)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := m.httpClient.Do(req)
+			if err != nil {
+				dialog.ShowError(err, m.window)
+				return
+			}
+			defer resp.Body.Close()
+			dialog.ShowInformation("Event Added", "Event added! Next reTerminal refresh will display it.", m.window)
+		}()
 	}, m.window)
+}
+
+// ==============================================================================
+// My Cloud Files & Data Management
+// ==============================================================================
+
+func (m *ManagerApp) buildUserDataTab() fyne.CanvasObject {
+	m.storageUsageLabel = widget.NewLabel("Storage Usage: Log in to inspect your cloud storage.")
+	m.filesListContainer = container.NewVBox()
+
+	refreshBtn := widget.NewButtonWithIcon("Refresh Files", theme.ViewRefreshIcon(), func() {
+		m.refreshUserFiles()
+	})
+
+	uploadBtn := widget.NewButtonWithIcon("Upload File to NAS", theme.UploadIcon(), func() {
+		m.uploadFileToCloud()
+	})
+	uploadBtn.Importance = widget.HighImportance
+
+	header := container.NewBorder(
+		nil, nil,
+		m.storageUsageLabel,
+		container.NewHBox(uploadBtn, refreshBtn),
+	)
+
+	return container.NewBorder(
+		container.NewVBox(header, widget.NewSeparator()),
+		nil, nil, nil,
+		container.NewScroll(m.filesListContainer),
+	)
+}
+
+func (m *ManagerApp) refreshUserFiles() {
+	if m.authToken == "" {
+		m.storageUsageLabel.SetText("Storage: Not logged in")
+		m.filesListContainer.Objects = nil
+		m.filesListContainer.Refresh()
+		return
+	}
+
+	go func() {
+		// 1. Fetch quota
+		reqQuota, _ := http.NewRequest("GET", m.apiBaseURL+"/api/v1/storage/quota", nil)
+		reqQuota.Header.Set("Authorization", "Bearer "+m.authToken)
+		if resp, err := m.httpClient.Do(reqQuota); err == nil {
+			var qRes struct {
+				Data struct {
+					UsedBytes  int64   `json:"used_bytes"`
+					QuotaBytes int64   `json:"quota_bytes"`
+					Percentage float64 `json:"percentage"`
+				} `json:"data"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&qRes); err == nil {
+				m.storageUsageLabel.SetText(fmt.Sprintf("Storage: %.2f MB / %.2f GB (%.1f%% used)",
+					float64(qRes.Data.UsedBytes)/(1024*1024),
+					float64(qRes.Data.QuotaBytes)/(1024*1024*1024),
+					qRes.Data.Percentage))
+			}
+			resp.Body.Close()
+		}
+
+		// 2. Fetch file list
+		reqFiles, _ := http.NewRequest("GET", m.apiBaseURL+"/api/v1/storage/files", nil)
+		reqFiles.Header.Set("Authorization", "Bearer "+m.authToken)
+		respFiles, err := m.httpClient.Do(reqFiles)
+		if err != nil {
+			return
+		}
+		defer respFiles.Body.Close()
+
+		var res struct {
+			Data []struct {
+				Name    string    `json:"name"`
+				Size    int64     `json:"size"`
+				ModTime time.Time `json:"mod_time"`
+				IsDir   bool      `json:"is_dir"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(respFiles.Body).Decode(&res); err != nil {
+			return
+		}
+
+		var items []fyne.CanvasObject
+		if len(res.Data) == 0 {
+			items = append(items, widget.NewLabel("No files uploaded yet. Click 'Upload File to NAS' to store data on your PocketCloud NAS!"))
+		} else {
+			for _, file := range res.Data {
+				fileName := file.Name
+				fileSizeKB := float64(file.Size) / 1024.0
+
+				label := widget.NewLabel(fmt.Sprintf("📄 %s (%.1f KB) - %s", fileName, fileSizeKB, file.ModTime.Format("2006-01-02 15:04")))
+
+				downloadBtn := widget.NewButtonWithIcon("Download", theme.DownloadIcon(), func() {
+					m.downloadCloudFile(fileName)
+				})
+
+				deleteBtn := widget.NewButtonWithIcon("Delete", theme.DeleteIcon(), func() {
+					m.deleteCloudFile(fileName)
+				})
+				deleteBtn.Importance = widget.DangerImportance
+
+				row := container.NewBorder(nil, nil, label, container.NewHBox(downloadBtn, deleteBtn))
+				items = append(items, row, widget.NewSeparator())
+			}
+		}
+
+		m.filesListContainer.Objects = items
+		m.filesListContainer.Refresh()
+	}()
+}
+
+func (m *ManagerApp) uploadFileToCloud() {
+	if m.authToken == "" {
+		dialog.ShowInformation("Login Required", "Please log in to upload files.", m.window)
+		return
+	}
+
+	dialog.ShowFileOpen(func(reader fyne.URIReadCloser, err error) {
+		if err != nil || reader == nil {
+			return
+		}
+		defer reader.Close()
+
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			dialog.ShowError(err, m.window)
+			return
+		}
+
+		fileName := reader.URI().Name()
+
+		go func() {
+			var b bytes.Buffer
+			w := multipart.NewWriter(&b)
+			part, err := w.CreateFormFile("file", fileName)
+			if err != nil {
+				dialog.ShowError(err, m.window)
+				return
+			}
+			_, _ = part.Write(data)
+			_ = w.Close()
+
+			req, _ := http.NewRequest("POST", m.apiBaseURL+"/api/v1/storage/upload", &b)
+			req.Header.Set("Authorization", "Bearer "+m.authToken)
+			req.Header.Set("Content-Type", w.FormDataContentType())
+
+			resp, err := m.httpClient.Do(req)
+			if err != nil {
+				dialog.ShowError(err, m.window)
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode == http.StatusCreated {
+				dialog.ShowInformation("Uploaded", fmt.Sprintf("Successfully uploaded %s to NAS!", fileName), m.window)
+				m.refreshUserFiles()
+			} else {
+				resBody, _ := io.ReadAll(resp.Body)
+				dialog.ShowError(fmt.Errorf("Upload failed: %s", string(resBody)), m.window)
+			}
+		}()
+	}, m.window)
+}
+
+func (m *ManagerApp) downloadCloudFile(fileName string) {
+	dialog.ShowFileSave(func(writer fyne.URIWriteCloser, err error) {
+		if err != nil || writer == nil {
+			return
+		}
+		defer writer.Close()
+
+		go func() {
+			url := fmt.Sprintf("%s/api/v1/storage/download?path=%s", m.apiBaseURL, fileName)
+			req, _ := http.NewRequest("GET", url, nil)
+			req.Header.Set("Authorization", "Bearer "+m.authToken)
+			resp, err := m.httpClient.Do(req)
+			if err != nil {
+				dialog.ShowError(err, m.window)
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				dialog.ShowError(fmt.Errorf("Download failed with status %d", resp.StatusCode), m.window)
+				return
+			}
+
+			_, _ = io.Copy(writer, resp.Body)
+			dialog.ShowInformation("Downloaded", fmt.Sprintf("File %s downloaded successfully!", fileName), m.window)
+		}()
+	}, m.window)
+}
+
+func (m *ManagerApp) deleteCloudFile(fileName string) {
+	dialog.ShowConfirm("Delete File", fmt.Sprintf("Are you sure you want to delete %q from your cloud storage?", fileName), func(confirmed bool) {
+		if !confirmed {
+			return
+		}
+		go func() {
+			url := fmt.Sprintf("%s/api/v1/storage/files?path=%s", m.apiBaseURL, fileName)
+			req, _ := http.NewRequest("DELETE", url, nil)
+			req.Header.Set("Authorization", "Bearer "+m.authToken)
+			resp, err := m.httpClient.Do(req)
+			if err != nil {
+				dialog.ShowError(err, m.window)
+				return
+			}
+			defer resp.Body.Close()
+			dialog.ShowInformation("Deleted", fmt.Sprintf("File %s deleted.", fileName), m.window)
+			m.refreshUserFiles()
+		}()
+	}, m.window)
+}
+
+// ==============================================================================
+// Admin: User Management (Create, Edit, Delete, API Key)
+// ==============================================================================
+
+func (m *ManagerApp) buildUsersTab() fyne.CanvasObject {
+	m.usersTableContainer = container.NewVBox()
+
+	refreshBtn := widget.NewButtonWithIcon("Refresh Users", theme.ViewRefreshIcon(), func() {
+		m.refreshUsersList()
+	})
+
+	createUserBtn := widget.NewButtonWithIcon("Create New User", theme.ContentAddIcon(), func() {
+		m.showCreateUserDialog()
+	})
+	createUserBtn.Importance = widget.HighImportance
+
+	header := container.NewBorder(
+		nil, nil,
+		widget.NewLabelWithStyle("Admin User Management (Create, Edit, Delete, API Keys)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.NewHBox(createUserBtn, refreshBtn),
+	)
+
+	return container.NewBorder(
+		container.NewVBox(header, widget.NewSeparator()),
+		nil, nil, nil,
+		container.NewScroll(m.usersTableContainer),
+	)
+}
+
+func (m *ManagerApp) refreshUsersList() {
+	if m.authToken == "" {
+		m.usersTableContainer.Objects = []fyne.CanvasObject{widget.NewLabel("Please log in as an administrator to view and manage users.")}
+		m.usersTableContainer.Refresh()
+		return
+	}
+
+	go func() {
+		req, _ := http.NewRequest("GET", m.apiBaseURL+"/api/v1/admin/users", nil)
+		req.Header.Set("Authorization", "Bearer "+m.authToken)
+		resp, err := m.httpClient.Do(req)
+		if err != nil {
+			dialog.ShowError(err, m.window)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			m.usersTableContainer.Objects = []fyne.CanvasObject{widget.NewLabel("Access Denied: Current user does not have Administrator privileges.")}
+			m.usersTableContainer.Refresh()
+			return
+		}
+
+		var res struct {
+			Data []*database.User `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+			return
+		}
+
+		var rows []fyne.CanvasObject
+		for _, u := range res.Data {
+			userCopy := *u
+			cardHeader := fmt.Sprintf("👤 %s (%s)", userCopy.Username, strings.ToUpper(string(userCopy.Role)))
+			quotaGB := float64(userCopy.QuotaBytes) / (1024 * 1024 * 1024)
+			usedMB := float64(userCopy.StorageUsedBytes) / (1024 * 1024)
+
+			stats := widget.NewLabel(fmt.Sprintf("Email: %s | Quota: %.1f GB | Used: %.2f MB\nAPI Key: %s",
+				userCopy.Email, quotaGB, usedMB, userCopy.APIKey))
+
+			editBtn := widget.NewButtonWithIcon("Edit", theme.DocumentCreateIcon(), func() {
+				m.showEditUserDialog(&userCopy)
+			})
+			deleteBtn := widget.NewButtonWithIcon("Delete", theme.DeleteIcon(), func() {
+				m.confirmDeleteUser(&userCopy)
+			})
+			deleteBtn.Importance = widget.DangerImportance
+
+			copyKeyBtn := widget.NewButtonWithIcon("Copy Key", theme.ContentCopyIcon(), func() {
+				m.window.Clipboard().SetContent(userCopy.APIKey)
+				dialog.ShowInformation("Copied", fmt.Sprintf("Copied API key for user %s", userCopy.Username), m.window)
+			})
+
+			regenBtn := widget.NewButtonWithIcon("Regen Key", theme.ViewRefreshIcon(), func() {
+				m.adminRegenKey(userCopy.ID)
+			})
+
+			actions := container.NewHBox(editBtn, copyKeyBtn, regenBtn, deleteBtn)
+			userCard := widget.NewCard(cardHeader, "", container.NewVBox(stats, actions))
+			rows = append(rows, userCard)
+		}
+
+		m.usersTableContainer.Objects = rows
+		m.usersTableContainer.Refresh()
+	}()
+}
+
+func (m *ManagerApp) showCreateUserDialog() {
+	if m.authToken == "" {
+		dialog.ShowInformation("Not Logged In", "Please log in as admin first.", m.window)
+		return
+	}
+	userEntry := widget.NewEntry()
+	emailEntry := widget.NewEntry()
+	passEntry := widget.NewPasswordEntry()
+	apiKeyEntry := widget.NewEntry()
+	apiKeyEntry.SetPlaceHolder("(Optional: leave blank to auto-generate secure 32-byte key)")
+
+	roleSelect := widget.NewSelect([]string{"user", "admin"}, nil)
+	roleSelect.SetSelected("user")
+	quotaEntry := widget.NewEntry()
+	quotaEntry.SetText("50")
+
+	items := []*widget.FormItem{
+		widget.NewFormItem("Username", userEntry),
+		widget.NewFormItem("Email", emailEntry),
+		widget.NewFormItem("Password", passEntry),
+		widget.NewFormItem("Custom API Key", apiKeyEntry),
+		widget.NewFormItem("Role", roleSelect),
+		widget.NewFormItem("Quota (GB)", quotaEntry),
+	}
+
+	dialog.ShowForm("Admin: Create New User", "Create User", "Cancel", items, func(confirmed bool) {
+		if !confirmed || userEntry.Text == "" || passEntry.Text == "" {
+			return
+		}
+		qGB, _ := strconv.ParseInt(quotaEntry.Text, 10, 64)
+		if qGB <= 0 {
+			qGB = 50
+		}
+		payload := map[string]interface{}{
+			"username":    userEntry.Text,
+			"email":       emailEntry.Text,
+			"password":    passEntry.Text,
+			"api_key":     strings.TrimSpace(apiKeyEntry.Text),
+			"role":        roleSelect.Selected,
+			"quota_bytes": qGB * 1024 * 1024 * 1024,
+		}
+		go func() {
+			b, _ := json.Marshal(payload)
+			req, _ := http.NewRequest("POST", m.apiBaseURL+"/api/v1/admin/users", bytes.NewReader(b))
+			req.Header.Set("Authorization", "Bearer "+m.authToken)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := m.httpClient.Do(req)
+			if err != nil {
+				dialog.ShowError(err, m.window)
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusCreated {
+				dialog.ShowInformation("User Created", fmt.Sprintf("User %q created successfully!", userEntry.Text), m.window)
+				m.refreshUsersList()
+			} else {
+				data, _ := io.ReadAll(resp.Body)
+				dialog.ShowError(fmt.Errorf("Failed: %s", string(data)), m.window)
+			}
+		}()
+	}, m.window)
+}
+
+func (m *ManagerApp) showEditUserDialog(u *database.User) {
+	usernameEntry := widget.NewEntry()
+	usernameEntry.SetText(u.Username)
+	emailEntry := widget.NewEntry()
+	emailEntry.SetText(u.Email)
+	passEntry := widget.NewPasswordEntry()
+	passEntry.SetPlaceHolder("(Leave empty to keep existing password)")
+	apiKeyEntry := widget.NewEntry()
+	apiKeyEntry.SetText(u.APIKey)
+	roleSelect := widget.NewSelect([]string{"user", "admin"}, nil)
+	roleSelect.SetSelected(string(u.Role))
+	quotaEntry := widget.NewEntry()
+	quotaEntry.SetText(fmt.Sprintf("%d", u.QuotaBytes/(1024*1024*1024)))
+
+	items := []*widget.FormItem{
+		widget.NewFormItem("Username", usernameEntry),
+		widget.NewFormItem("Email", emailEntry),
+		widget.NewFormItem("New Password", passEntry),
+		widget.NewFormItem("API Key", apiKeyEntry),
+		widget.NewFormItem("Role", roleSelect),
+		widget.NewFormItem("Quota (GB)", quotaEntry),
+	}
+
+	dialog.ShowForm("Admin: Edit User "+u.Username, "Save Changes", "Cancel", items, func(confirmed bool) {
+		if !confirmed {
+			return
+		}
+		qGB, _ := strconv.ParseInt(quotaEntry.Text, 10, 64)
+		if qGB <= 0 {
+			qGB = 50
+		}
+		payload := map[string]interface{}{
+			"username":    strings.TrimSpace(usernameEntry.Text),
+			"email":       emailEntry.Text,
+			"role":        roleSelect.Selected,
+			"quota_bytes": qGB * 1024 * 1024 * 1024,
+			"api_key":     strings.TrimSpace(apiKeyEntry.Text),
+			"password":    passEntry.Text,
+		}
+		go func() {
+			b, _ := json.Marshal(payload)
+			req, _ := http.NewRequest("PUT", fmt.Sprintf("%s/api/v1/admin/users/%d", m.apiBaseURL, u.ID), bytes.NewReader(b))
+			req.Header.Set("Authorization", "Bearer "+m.authToken)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := m.httpClient.Do(req)
+			if err != nil {
+				dialog.ShowError(err, m.window)
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				dialog.ShowInformation("Updated", "User details updated!", m.window)
+				m.refreshUsersList()
+			} else {
+				data, _ := io.ReadAll(resp.Body)
+				dialog.ShowError(fmt.Errorf("Update failed: %s", string(data)), m.window)
+			}
+		}()
+	}, m.window)
+}
+
+func (m *ManagerApp) confirmDeleteUser(u *database.User) {
+	dialog.ShowConfirm("Delete User", fmt.Sprintf("Are you sure you want to delete user %q?\nThis will permanently remove their account, API key, and storage directory.", u.Username), func(confirmed bool) {
+		if !confirmed {
+			return
+		}
+		go func() {
+			req, _ := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/admin/users/%d", m.apiBaseURL, u.ID), nil)
+			req.Header.Set("Authorization", "Bearer "+m.authToken)
+			resp, err := m.httpClient.Do(req)
+			if err != nil {
+				dialog.ShowError(err, m.window)
+				return
+			}
+			defer resp.Body.Close()
+			dialog.ShowInformation("Deleted", fmt.Sprintf("User %s has been deleted.", u.Username), m.window)
+			m.refreshUsersList()
+		}()
+	}, m.window)
+}
+
+func (m *ManagerApp) adminRegenKey(userID int64) {
+	go func() {
+		req, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/admin/users/%d/apikey", m.apiBaseURL, userID), nil)
+		req.Header.Set("Authorization", "Bearer "+m.authToken)
+		resp, err := m.httpClient.Do(req)
+		if err != nil {
+			dialog.ShowError(err, m.window)
+			return
+		}
+		defer resp.Body.Close()
+
+		var res struct {
+			Data struct {
+				APIKey string `json:"api_key"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&res); err == nil {
+			dialog.ShowInformation("New API Key", fmt.Sprintf("Key regenerated:\n%s", res.Data.APIKey), m.window)
+			m.refreshUsersList()
+		}
+	}()
+}
+
+// ==============================================================================
+// Admin: System-Wide Settings & Health
+// ==============================================================================
+
+func (m *ManagerApp) buildSettingsTab() fyne.CanvasObject {
+	m.mountPathEntry = widget.NewEntry()
+	m.mountPathEntry.SetText("/mnt/pocketcloud/storage")
+	m.settingsPortEntry = widget.NewEntry()
+	m.settingsPortEntry.SetText("8080")
+	m.quotaEntry = widget.NewEntry()
+	m.quotaEntry.SetText("50")
+	m.uploadEntry = widget.NewEntry()
+	m.uploadEntry.SetText("2048")
+	m.allowRegCheck = widget.NewCheck("Allow Public User Self-Registration", nil)
+	m.allowRegCheck.SetChecked(true)
+	m.healthStatusLabel = widget.NewLabel("Health: Click 'Fetch Server Settings & Health' to query system status.")
+	m.healthStatusLabel.Wrapping = fyne.TextWrapWord
+
+	fetchBtn := widget.NewButtonWithIcon("Fetch Server Settings & Health", theme.DownloadIcon(), func() {
+		m.fetchAdminSettings()
+	})
+
+	saveBtn := widget.NewButtonWithIcon("Save System Settings", theme.DocumentSaveIcon(), func() {
+		m.saveAdminSettings()
+	})
+	saveBtn.Importance = widget.HighImportance
+
+	form := widget.NewForm(
+		widget.NewFormItem("Server Port", m.settingsPortEntry),
+		widget.NewFormItem("NAS Base Mount Path", m.mountPathEntry),
+		widget.NewFormItem("Default Quota per User (GB)", m.quotaEntry),
+		widget.NewFormItem("Max Upload File Size (MB)", m.uploadEntry),
+		widget.NewFormItem("Public Registration", m.allowRegCheck),
+	)
+
+	return container.NewScroll(container.NewVBox(
+		widget.NewLabelWithStyle("System-Wide Server Configuration", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.NewHBox(fetchBtn, saveBtn),
+		widget.NewSeparator(),
+		form,
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("System Health & NAS Hardware Status:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		m.healthStatusLabel,
+	))
+}
+
+func (m *ManagerApp) fetchAdminSettings() {
+	if m.authToken == "" {
+		dialog.ShowInformation("Login Required", "Please log in as admin.", m.window)
+		return
+	}
+	go func() {
+		// Fetch settings
+		req, _ := http.NewRequest("GET", m.apiBaseURL+"/api/v1/admin/settings", nil)
+		req.Header.Set("Authorization", "Bearer "+m.authToken)
+		resp, err := m.httpClient.Do(req)
+		if err != nil {
+			dialog.ShowError(err, m.window)
+			return
+		}
+		defer resp.Body.Close()
+
+		var res struct {
+			Data config.Config `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&res); err == nil {
+			m.mountPathEntry.SetText(res.Data.Storage.BaseMountPath)
+			m.settingsPortEntry.SetText(fmt.Sprintf("%d", res.Data.Server.Port))
+			m.quotaEntry.SetText(fmt.Sprintf("%d", res.Data.Storage.DefaultQuotaBytes/(1024*1024*1024)))
+			m.uploadEntry.SetText(fmt.Sprintf("%d", res.Data.Storage.MaxUploadSizeMB))
+			m.allowRegCheck.SetChecked(res.Data.Auth.AllowRegistration)
+		}
+
+		// Fetch health
+		reqH, _ := http.NewRequest("GET", m.apiBaseURL+"/api/v1/admin/health", nil)
+		reqH.Header.Set("Authorization", "Bearer "+m.authToken)
+		if respH, err := m.httpClient.Do(reqH); err == nil {
+			var hRes struct {
+				Data struct {
+					Status       string `json:"status"`
+					Uptime       string `json:"uptime"`
+					GoVersion    string `json:"go_version"`
+					NumGoroutine int    `json:"num_goroutine"`
+					Memory       struct {
+						AllocMB int `json:"alloc_mb"`
+						SysMB   int `json:"sys_mb"`
+					} `json:"memory"`
+				} `json:"data"`
+			}
+			if err := json.NewDecoder(respH.Body).Decode(&hRes); err == nil {
+				m.healthStatusLabel.SetText(fmt.Sprintf("Status: %s | Uptime: %s | Goroutines: %d | Mem Alloc: %d MB (Sys: %d MB) | Runtime: %s",
+					strings.ToUpper(hRes.Data.Status), hRes.Data.Uptime, hRes.Data.NumGoroutine, hRes.Data.Memory.AllocMB, hRes.Data.Memory.SysMB, hRes.Data.GoVersion))
+			}
+			respH.Body.Close()
+		}
+
+		dialog.ShowInformation("Fetched", "Settings and system health retrieved successfully!", m.window)
+	}()
+}
+
+func (m *ManagerApp) saveAdminSettings() {
+	if m.authToken == "" {
+		dialog.ShowInformation("Login Required", "Please log in as admin.", m.window)
+		return
+	}
+	port, _ := strconv.Atoi(m.settingsPortEntry.Text)
+	quota, _ := strconv.ParseInt(m.quotaEntry.Text, 10, 64)
+	upload, _ := strconv.ParseInt(m.uploadEntry.Text, 10, 64)
+
+	payload := map[string]interface{}{
+		"port":               port,
+		"base_mount_path":    m.mountPathEntry.Text,
+		"default_quota_gb":   quota,
+		"max_upload_size_mb": upload,
+		"allow_registration": m.allowRegCheck.Checked,
+	}
+
+	go func() {
+		b, _ := json.Marshal(payload)
+		req, _ := http.NewRequest("PUT", m.apiBaseURL+"/api/v1/admin/settings", bytes.NewReader(b))
+		req.Header.Set("Authorization", "Bearer "+m.authToken)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := m.httpClient.Do(req)
+		if err != nil {
+			dialog.ShowError(err, m.window)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			dialog.ShowInformation("Saved", "System-wide settings updated successfully!", m.window)
+		} else {
+			data, _ := io.ReadAll(resp.Body)
+			dialog.ShowError(fmt.Errorf("Update failed: %s", string(data)), m.window)
+		}
+	}()
+}
+
+// ==============================================================================
+// SSH & Host Service Management
+// ==============================================================================
+
+func (m *ManagerApp) buildServiceTab() fyne.CanvasObject {
+	m.hostEntry = widget.NewEntry()
+	m.hostEntry.SetText("192.168.3.54")
+	m.portEntry = widget.NewEntry()
+	m.portEntry.SetText("22")
+	m.userEntry = widget.NewEntry()
+	m.userEntry.SetText("lab")
+	m.passEntry = widget.NewPasswordEntry()
+	m.passEntry.SetPlaceHolder("SSH password")
+	m.keyEntry = widget.NewEntry()
+	m.keyEntry.SetPlaceHolder("~/.ssh/id_rsa (optional)")
+	m.connLabel = widget.NewLabel("SSH: Disconnected")
+
+	connectBtn := widget.NewButtonWithIcon("Connect SSH", theme.LoginIcon(), func() {
+		m.connectSSH()
+	})
+
+	m.serviceStatusLabel = widget.NewLabel("Systemd Service: Unknown")
+	m.logsEntry = widget.NewMultiLineEntry()
+	m.logsEntry.SetMinRowsVisible(14)
+
+	refreshBtn := widget.NewButtonWithIcon("Refresh Status & Logs", theme.ViewRefreshIcon(), func() {
+		m.refreshStatus()
+	})
+	startBtn := widget.NewButtonWithIcon("Start Service", theme.MediaPlayIcon(), func() {
+		m.runServiceCmd("sudo systemctl start neonservices")
+	})
+	stopBtn := widget.NewButtonWithIcon("Stop Service", theme.MediaStopIcon(), func() {
+		m.runServiceCmd("sudo systemctl stop neonservices")
+	})
+	restartBtn := widget.NewButtonWithIcon("Restart Service", theme.ViewRefreshIcon(), func() {
+		m.runServiceCmd("sudo systemctl restart neonservices")
+	})
+
+	connBox := container.NewVBox(
+		widget.NewLabelWithStyle("SSH Host Connection:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.NewGridWithColumns(5, m.hostEntry, m.portEntry, m.userEntry, m.passEntry, connectBtn),
+		m.connLabel,
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Remote neonservices.service Controls:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		m.serviceStatusLabel,
+		container.NewHBox(refreshBtn, startBtn, restartBtn, stopBtn),
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Recent Journalctl Logs:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		m.logsEntry,
+	)
+
+	return container.NewScroll(connBox)
+}
+
+func (m *ManagerApp) connectSSH() {
+	m.connLabel.SetText("Connecting via SSH...")
+	port, _ := strconv.Atoi(m.portEntry.Text)
+	if port <= 0 {
+		port = 22
+	}
+	go func() {
+		client := sshutil.NewClient(sshutil.Options{
+			Host:     m.hostEntry.Text,
+			Port:     port,
+			User:     m.userEntry.Text,
+			Password: m.passEntry.Text,
+			KeyPath:  m.keyEntry.Text,
+			Timeout:  10 * time.Second,
+		})
+		if err := client.Connect(); err != nil {
+			m.connLabel.SetText(fmt.Sprintf("SSH Error: %v", err))
+			dialog.ShowError(err, m.window)
+			return
+		}
+		m.sshClient = client
+		m.connLabel.SetText(fmt.Sprintf("SSH Connected to %s@%s:%d", m.userEntry.Text, m.hostEntry.Text, port))
+		m.refreshStatus()
+	}()
+}
+
+func (m *ManagerApp) runServiceCmd(cmd string) {
+	if m.sshClient == nil {
+		dialog.ShowInformation("Not Connected", "Please connect to SSH first.", m.window)
+		return
+	}
+	go func() {
+		_, err := m.sshClient.Run(cmd)
+		if err != nil {
+			dialog.ShowError(err, m.window)
+		}
+		time.Sleep(500 * time.Millisecond)
+		m.refreshStatus()
+	}()
+}
+
+func (m *ManagerApp) refreshStatus() {
+	if m.sshClient == nil {
+		return
+	}
+	go func() {
+		statusOut, _ := m.sshClient.Run("systemctl is-active neonservices || true")
+		status := strings.TrimSpace(statusOut)
+		m.serviceStatusLabel.SetText(fmt.Sprintf("neonservices.service: %s", strings.ToUpper(status)))
+
+		logs, err := m.sshClient.Run("journalctl -u neonservices -n 35 --no-pager 2>&1 || true")
+		if err == nil {
+			m.logsEntry.SetText(logs)
+		}
+	}()
+}
+
+// ==============================================================================
+// NAS Host Storage & Mount Tab
+// ==============================================================================
+
+func (m *ManagerApp) buildNASTab() fyne.CanvasObject {
+	m.nasStatusText = widget.NewLabel("NAS Status: Not queried. Connect SSH and click below to inspect.")
+	m.nasStatusText.Wrapping = fyne.TextWrapWord
+
+	inspectBtn := widget.NewButtonWithIcon("Inspect Hardware NAS Mount", theme.SearchIcon(), func() {
+		if m.sshClient == nil {
+			dialog.ShowInformation("Not Connected", "Please connect to SSH in the SSH tab first.", m.window)
+			return
+		}
+		go func() {
+			cmd := "df -h /mnt/pocketcloud && ls -la /mnt/pocketcloud 2>&1 || true"
+			out, err := m.sshClient.Run(cmd)
+			if err != nil {
+				m.nasStatusText.SetText(fmt.Sprintf("Failed or unmounted:\n%s\n%v", out, err))
+			} else {
+				m.nasStatusText.SetText(fmt.Sprintf("StationPC PocketCloud NAS Storage Status:\n\n%s", out))
+			}
+		}()
+	})
+
+	return container.NewVBox(
+		widget.NewLabelWithStyle("StationPC PocketCloud NAS Host Mount (/mnt/pocketcloud):", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		inspectBtn,
+		widget.NewSeparator(),
+		m.nasStatusText,
+	)
 }

@@ -15,6 +15,7 @@ type User struct {
 	Email            string    `json:"email"`
 	PasswordHash     string    `json:"-"`
 	Role             Role      `json:"role"`
+	APIKey           string    `json:"api_key"`
 	QuotaBytes       int64     `json:"quota_bytes"`
 	StorageUsedBytes int64     `json:"storage_used_bytes"`
 	CreatedAt        time.Time `json:"created_at"`
