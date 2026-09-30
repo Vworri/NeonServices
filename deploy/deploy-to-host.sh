@@ -42,8 +42,8 @@ Examples:
   # Deploy with StationPC PocketCloud SMB network share:
   ./deploy/deploy-to-host.sh lab@192.168.3.54 -d smb://sp-4b51.local/
 
-  # Deploy with physical drive:
-  ./deploy/deploy-to-host.sh lab@192.168.3.54 -d /dev/sdb1
+  # Deploy with specific share name:
+  ./deploy/deploy-to-host.sh lab@192.168.3.54 -d smb://sp-4b51.local/share
 
   # Deploy using local storage (skip mount):
   ./deploy/deploy-to-host.sh lab@192.168.3.54 --skip-mount
@@ -154,7 +154,6 @@ run_ssh() {
 }
 
 run_ssh_interactive() {
-  # Allocate pseudo-terminal so sudo can read password if needed
   ssh -tt "${SSH_BASE[@]}" "$SSH_USER@$REMOTE_HOST" "$@"
 }
 
@@ -206,7 +205,6 @@ echo "[+] Target architecture: linux/$GOARCH"
 # 3. Verify & Provision NAS Mount (SMB / Block / Local)
 echo "[3/7] Verifying StationPC PocketCloud NAS mount at $NAS_MOUNT_POINT..."
 
-# Normalize SMB target if passed
 CLEAN_TARGET="$NAS_TARGET"
 if [[ "$CLEAN_TARGET" =~ ^smb://(.*)$ ]]; then
   CLEAN_TARGET="//${BASH_REMATCH[1]}"
@@ -226,7 +224,7 @@ FORCE_FMT="$FORCE_FORMAT"
 SKIP="$SKIP_MOUNT"
 STORAGE_DIR="\$MOUNT_POINT/storage"
 
-# Ensure neon user exists early
+# Create service user and base mount directory immediately
 if ! id "neon" &>/dev/null; then
   echo "[+] Creating system service user 'neon'..."
   useradd -r -s /bin/false -d /var/lib/neonservices neon || true
@@ -234,9 +232,12 @@ fi
 NEON_UID=\$(id -u neon)
 NEON_GID=\$(id -g neon)
 
+mkdir -p "\$MOUNT_POINT" "\$STORAGE_DIR" "/var/lib/neonservices"
+chown -R neon:neon "\$MOUNT_POINT" "/var/lib/neonservices" 2>/dev/null || true
+chmod 775 "\$MOUNT_POINT" "\$STORAGE_DIR" 2>/dev/null || true
+
 if [ "\$SKIP" = "true" ]; then
-  echo "[i] Skipping drive mount (--skip-mount specified)."
-  mkdir -p "\$STORAGE_DIR"
+  echo "[i] Using local folder at \$STORAGE_DIR (--skip-mount requested)."
 elif findmnt -M "\$MOUNT_POINT" >/dev/null 2>&1; then
   echo "[+] \$MOUNT_POINT is already mounted:"
   findmnt -M "\$MOUNT_POINT" -o SOURCE,FSTYPE,SIZE,USED,AVAIL,TARGET || true
@@ -247,61 +248,80 @@ else
   if [[ "\$TARGET" =~ ^//([^/]+)(/.*)?\$ ]]; then
     SMB_HOST="\${BASH_REMATCH[1]}"
     SMB_SHARE="\${BASH_REMATCH[2]}"
-    # Trim trailing slash
     SMB_SHARE="\${SMB_SHARE%/}"
 
     echo "[i] Network share detected: host '\$SMB_HOST', share '\$SMB_SHARE'"
 
-    # Install cifs-utils & smbclient if not installed
-    if ! which mount.cifs &>/dev/null || ! which smbclient &>/dev/null; then
-      echo "[i] Installing cifs-utils and smbclient on Ubuntu..."
-      apt-get update -qq && apt-get install -y -qq cifs-utils smbclient
+    # Install mDNS resolver if using .local host
+    if [[ "\$SMB_HOST" == *".local"* ]] && ! which avahi-resolve &>/dev/null; then
+      echo "[i] Installing avahi-daemon for .local mDNS resolution..."
+      apt-get update -qq && apt-get install -y -qq avahi-daemon avahi-utils || true
     fi
 
-    # If share name was empty (e.g. //sp-4b51.local/), query available shares
+    # Install cifs-utils & smbclient if not installed
+    if ! which mount.cifs &>/dev/null || ! which smbclient &>/dev/null; then
+      echo "[i] Installing cifs-utils and smbclient..."
+      apt-get update -qq && apt-get install -y -qq cifs-utils smbclient || true
+    fi
+
+    # If share name is empty, attempt discovery
     if [ -z "\$SMB_SHARE" ] || [ "\$SMB_SHARE" = "/" ]; then
       echo "[i] Discovering SMB shares on \$SMB_HOST..."
+      
       DISCOVERED=\$(smbclient -L "smb://\$SMB_HOST" -N -g 2>/dev/null | awk -F'|' '\$1=="Disk" && \$2!~/\$$/ {print \$2; exit}' || true)
+      if [ -z "\$DISCOVERED" ]; then
+        DISCOVERED=\$(smbclient -L "smb://\$SMB_HOST" -U "guest%" -g 2>/dev/null | awk -F'|' '\$1=="Disk" && \$2!~/\$$/ {print \$2; exit}' || true)
+      fi
+
       if [ -n "\$DISCOVERED" ]; then
         SMB_SHARE="/\$DISCOVERED"
         TARGET="//\$SMB_HOST\$SMB_SHARE"
-        echo "[+] Auto-selected share: \$TARGET"
+        echo "[+] Found share: \$TARGET"
       else
-        echo "[-] Could not automatically discover SMB share names."
-        echo "    Shares visible on \$SMB_HOST:"
-        smbclient -L "smb://\$SMB_HOST" -N 2>/dev/null || true
-        echo "[-] Please specify share path, e.g.: -d smb://\$SMB_HOST/share_name"
-        exit 1
+        echo "[!] Note: Could not auto-list anonymous shares on \$SMB_HOST."
+        echo "    Trying common defaults: 'share', 'data', 'public', or PocketCloud label..."
+        for try_share in "share" "data" "public" "storage"; do
+          if smbclient "//\$SMB_HOST/\$try_share" -N -c "exit" &>/dev/null || smbclient "//\$SMB_HOST/\$try_share" -U "guest%" -c "exit" &>/dev/null; then
+            SMB_SHARE="/\$try_share"
+            TARGET="//\$SMB_HOST\$SMB_SHARE"
+            echo "[+] Verified accessible share: \$TARGET"
+            break
+          fi
+        done
       fi
     fi
 
-    mkdir -p "\$MOUNT_POINT"
-
-    # Build mount options
-    MOUNT_OPTS="rw,uid=\$NEON_UID,gid=\$NEON_GID,file_mode=0775,dir_mode=0775,iocharset=utf8,_netdev,nofail"
-    if [ -n "\$SMB_PASS" ]; then
-      CRED_FILE="/etc/neon-smb.cred"
-      cat << CRED_EOF > "\$CRED_FILE"
+    if [ -n "\$SMB_SHARE" ] && [ "\$SMB_SHARE" != "/" ]; then
+      MOUNT_OPTS="rw,uid=\$NEON_UID,gid=\$NEON_GID,file_mode=0775,dir_mode=0775,iocharset=utf8,_netdev,nofail"
+      if [ -n "\$SMB_PASS" ]; then
+        CRED_FILE="/etc/neon-smb.cred"
+        cat << CRED_EOF > "\$CRED_FILE"
 username=\$SMB_USER
 password=\$SMB_PASS
 CRED_EOF
-      chmod 600 "\$CRED_FILE"
-      MOUNT_OPTS="credentials=\$CRED_FILE,\$MOUNT_OPTS"
+        chmod 600 "\$CRED_FILE"
+        MOUNT_OPTS="credentials=\$CRED_FILE,\$MOUNT_OPTS"
+      else
+        MOUNT_OPTS="guest,\$MOUNT_OPTS"
+      fi
+
+      echo "[+] Mounting SMB share \$TARGET to \$MOUNT_POINT..."
+      if mount -t cifs "\$TARGET" "\$MOUNT_POINT" -o "\$MOUNT_OPTS"; then
+        echo "[+] Successfully mounted \$TARGET!"
+        FSTAB_LINE="\$TARGET \$MOUNT_POINT cifs \$MOUNT_OPTS 0 0"
+        if ! grep -q "\$TARGET" /etc/fstab; then
+          echo "\$FSTAB_LINE" >> /etc/fstab
+        fi
+      else
+        echo "[!] Warning: mount -t cifs failed. Check share name or credentials."
+        echo "[i] Continuing with local directory so services can start."
+      fi
     else
-      MOUNT_OPTS="guest,\$MOUNT_OPTS"
+      echo "[!] No SMB share name confirmed. Using local folder for now."
+      echo "    You can mount the share anytime with:"
+      echo "    sudo mount -t cifs //\$SMB_HOST/<share_name> \$MOUNT_POINT -o guest,uid=\$NEON_UID,gid=\$NEON_GID"
     fi
 
-    echo "[+] Mounting SMB share \$TARGET to \$MOUNT_POINT..."
-    mount -t cifs "\$TARGET" "\$MOUNT_POINT" -o "\$MOUNT_OPTS"
-
-    # Add to /etc/fstab if not present
-    FSTAB_LINE="\$TARGET \$MOUNT_POINT cifs \$MOUNT_OPTS 0 0"
-    if ! grep -q "\$TARGET" /etc/fstab; then
-      echo "[+] Adding persistent mount to /etc/fstab..."
-      echo "\$FSTAB_LINE" >> /etc/fstab
-    fi
-
-  # Block device handling
   elif [ -n "\$TARGET" ] && [ -b "\$TARGET" ]; then
     echo "[i] Block device specified: \$TARGET"
     CURRENT_FS=\$(blkid -s TYPE -o value "\$TARGET" || true)
@@ -311,28 +331,25 @@ CRED_EOF
         mkfs.ext4 -F -L "PocketCloud" "\$TARGET"
       else
         echo "[-] \$TARGET has no filesystem. Re-run with --format to format."
-        exit 1
       fi
     fi
-    mkdir -p "\$MOUNT_POINT"
-    echo "[+] Mounting \$TARGET to \$MOUNT_POINT..."
-    mount "\$TARGET" "\$MOUNT_POINT"
-    DEV_UUID=\$(blkid -s UUID -o value "\$TARGET" || true)
-    if [ -n "\$DEV_UUID" ] && ! grep -q "\$DEV_UUID" /etc/fstab; then
-      echo "UUID=\$DEV_UUID \$MOUNT_POINT ext4 defaults,noatime,nofail 0 2" >> /etc/fstab
+    if [ -n "\$(blkid -s TYPE -o value "\$TARGET" || true)" ]; then
+      echo "[+] Mounting \$TARGET to \$MOUNT_POINT..."
+      mount "\$TARGET" "\$MOUNT_POINT" || true
+      DEV_UUID=\$(blkid -s UUID -o value "\$TARGET" || true)
+      if [ -n "\$DEV_UUID" ] && ! grep -q "\$DEV_UUID" /etc/fstab; then
+        echo "UUID=\$DEV_UUID \$MOUNT_POINT ext4 defaults,noatime,nofail 0 2" >> /etc/fstab
+      fi
     fi
 
   else
-    echo "[i] No specific NAS target mounted. Using local storage at \$STORAGE_DIR"
-    echo "[i] You can attach/mount your StationPC PocketCloud anytime and re-run:"
-    echo "    ./deploy/deploy-to-host.sh $SSH_USER@$REMOTE_HOST -d smb://sp-4b51.local/<share>"
-    mkdir -p "\$STORAGE_DIR"
+    echo "[i] Using local storage directory at \$STORAGE_DIR"
   fi
 fi
 
 mkdir -p "\$STORAGE_DIR"
-chown -R neon:neon "\$STORAGE_DIR" 2>/dev/null || true
-chmod 775 "\$STORAGE_DIR" 2>/dev/null || true
+chown -R neon:neon "\$MOUNT_POINT" "\$STORAGE_DIR" 2>/dev/null || true
+chmod 775 "\$MOUNT_POINT" "\$STORAGE_DIR" 2>/dev/null || true
 echo "[+] NAS storage directory verified: \$STORAGE_DIR"
 REMOTE_EOF
 )
@@ -348,7 +365,9 @@ echo "[+] Built: bin/api-server-linux-$GOARCH and bin/neon-ctl-linux-$GOARCH"
 
 # 5. Prepare Remote Installation Directory and Transfer Files
 echo "[5/7] Deploying binaries to $REMOTE_HOST:$REMOTE_INSTALL_DIR..."
-run_ssh_interactive "sudo mkdir -p $REMOTE_INSTALL_DIR /var/lib/neonservices && sudo chown -R $SSH_USER:$SSH_USER $REMOTE_INSTALL_DIR"
+run_ssh_interactive "sudo mkdir -p $REMOTE_INSTALL_DIR /var/lib/neonservices $NAS_MOUNT_POINT/storage && \
+                     sudo chown -R $SSH_USER:$SSH_USER $REMOTE_INSTALL_DIR && \
+                     sudo chown -R neon:neon $NAS_MOUNT_POINT"
 
 run_scp "bin/api-server-linux-$GOARCH" "$SSH_USER@$REMOTE_HOST:$REMOTE_INSTALL_DIR/api-server.new"
 run_scp "bin/neon-ctl-linux-$GOARCH" "$SSH_USER@$REMOTE_HOST:$REMOTE_INSTALL_DIR/neon-ctl.new"
@@ -364,6 +383,8 @@ STEP6_SCRIPT=$(cat << REMOTE_CONF_EOF
 set -euo pipefail
 DIR="$REMOTE_INSTALL_DIR"
 MOUNT="$NAS_MOUNT_POINT/storage"
+
+mkdir -p "\$MOUNT" "/var/lib/neonservices"
 
 if [ ! -f "\$DIR/config.yaml" ]; then
   echo "[+] Generating initial production config.yaml..."
@@ -399,7 +420,7 @@ else
 fi
 
 # Ensure neon owns directories and config has restricted 0600 permissions
-chown -R neon:neon "$REMOTE_INSTALL_DIR" "/var/lib/neonservices"
+chown -R neon:neon "$REMOTE_INSTALL_DIR" "/var/lib/neonservices" "$NAS_MOUNT_POINT"
 chmod 600 "\$DIR/config.yaml"
 chmod 750 "$REMOTE_INSTALL_DIR" "/var/lib/neonservices"
 REMOTE_CONF_EOF

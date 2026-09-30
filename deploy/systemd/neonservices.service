@@ -8,6 +8,8 @@ Type=simple
 User=neon
 Group=neon
 WorkingDirectory=/opt/neonservices
+ExecStartPre=+/bin/mkdir -p /var/lib/neonservices /mnt/pocketcloud/storage
+ExecStartPre=+/bin/chown -R neon:neon /var/lib/neonservices /mnt/pocketcloud/storage
 ExecStart=/opt/neonservices/api-server -config /opt/neonservices/config.yaml
 Restart=always
 RestartSec=5s
@@ -17,7 +19,8 @@ NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=read-only
 PrivateTmp=true
-ReadWritePaths=/var/lib/neonservices /mnt/pocketcloud
+# Leading '-' means don't fail if the path doesn't exist yet
+ReadWritePaths=/var/lib/neonservices -/mnt/pocketcloud
 
 # Environment
 Environment=GIN_MODE=release
