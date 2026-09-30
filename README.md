@@ -13,7 +13,7 @@ graph TD
     subgraph Desktop / Workstation
         Fyne["Fyne Management App (cmd/fyne-manager)"]
         CLI["Management CLI (cmd/neon-ctl)"]
-        Deploy["Deployment Script (deploy/deploy.sh)"]
+        Deploy["Deployment Script (deploy/deploy-to-host.sh)"]
     end
 
     subgraph Ubuntu Server
@@ -33,7 +33,7 @@ graph TD
     Fyne -->|SSH/SFTP (Push Secrets & Config)| SSH
     Fyne -->|systemctl restart & logs| SSH
     CLI -->|SSH / SFTP Ops| SSH
-    Deploy -->|SCP Binary & Systemd Reload| SSH
+    Deploy -->|1-Step Mount & Deploy| SSH
 
     Systemd -->|ExecStart & Supervise| API
     API -->|Persist Users & Metadata| DB
@@ -60,9 +60,13 @@ graph TD
   - Live StationPC PocketCloud NAS storage health and disk space viewer.
 - **Headless Companion CLI (`cmd/neon-ctl`)**:
   - Manage services, push/pull configurations, check logs, and inspect NAS status from any terminal without GUI dependencies.
-- **Automated SSH Deployment**:
-  - Zero-dependency static Linux Go binary compilation (`CGO_ENABLED=0` for `amd64` and `arm64`).
-  - Automated deployment script (`deploy/deploy.sh`) and host setup script (`deploy/setup-host.sh`).
+- **Automated SSH Deployment & NAS Provisioner (`deploy/deploy-to-host.sh`)**:
+  - Single command deployment accepting the server IP.
+  - Verifies and auto-mounts the StationPC PocketCloud NAS to `/mnt/pocketcloud`.
+  - Configures `/etc/fstab` for auto-mounting on reboot using partition UUID with `nofail`.
+  - Automatically provisions system user `neon` and directory permissions.
+  - Detects CPU architecture (`x86_64` vs `aarch64`) and cross-compiles static Go binaries (`CGO_ENABLED=0`).
+  - Installs and restarts the `neonservices.service` systemd daemon.
 - **Python Service Integration**:
   - Python worker template with token authentication and REST API client (`python/nas_worker.py`).
 
@@ -85,7 +89,8 @@ NeonServices/
 │   ├── storage/            # StationPC PocketCloud NAS manager & sandboxing
 │   └── sshutil/            # SSH & SFTP automation engine
 ├── deploy/
-│   ├── deploy.sh           # 1-step build & deploy script over SSH
+│   ├── deploy-to-host.sh   # 1-command deployment & NAS mounter script
+│   ├── deploy.sh           # Deployment wrapper
 │   ├── setup-host.sh       # Ubuntu machine bootstrap (users, permissions, systemd)
 │   └── systemd/            # Hardened systemd service definition
 ├── python/                 # Python companion worker template
@@ -98,54 +103,35 @@ NeonServices/
 
 ---
 
-## 🔌 StationPC PocketCloud NAS Integration
+## 🚢 1-Step SSH Deployment & NAS Provisioning
 
-The **STATIONPC PocketCloud** NAS attaches to your Ubuntu machine via USB-C / NVMe / High-Speed interface or local network:
-
-1. **Mounting the NAS on Ubuntu**:
-   Format or mount your partition to `/mnt/pocketcloud`:
-   ```bash
-   sudo mkdir -p /mnt/pocketcloud/storage
-   sudo mount /dev/sdX1 /mnt/pocketcloud
-   ```
-   Add to `/etc/fstab` for auto-mounting on boot:
-   ```
-   /dev/sdX1  /mnt/pocketcloud  ext4  defaults,noatime  0  2
-   ```
-
-2. **Storage Structure**:
-   ```
-   /mnt/pocketcloud/storage/
-   └── users/
-       ├── alice/
-       │   ├── documents/
-       │   └── photos/
-       └── bob/
-           └── backups/
-   ```
-
----
-
-## 🚀 Quickstart (Local Development)
-
-### 1. Build and Run API Server
+To deploy to your Ubuntu machine and ensure the StationPC PocketCloud NAS is mounted correctly:
 
 ```bash
-# Clone and enter directory
-cd /home/neonphnx/Projects/NeonServices
+# Basic usage with IP:
+./deploy/deploy-to-host.sh 192.168.1.100
 
-# Copy configuration
-cp config.example.yaml config.yaml
+# With specific user and SSH key:
+./deploy/deploy-to-host.sh ubuntu@192.168.1.100 -i ~/.ssh/id_ed25519
 
-# Build and run locally with auto-created test admin
-make run
+# Specifying block device and custom mount point:
+./deploy/deploy-to-host.sh 192.168.1.100 -d /dev/sdb1 -m /mnt/pocketcloud
 ```
 
-### 2. Run Tests
-
-```bash
-make test
-```
+### What `deploy-to-host.sh` Does Automatically:
+1. **Checks SSH Connectivity**: Tests connection with target credentials.
+2. **Detects CPU Architecture**: Maps `x86_64` -> `amd64` or `aarch64` -> `arm64`.
+3. **Verifies & Mounts the NAS**:
+   - Checks if `/mnt/pocketcloud` is already mounted via `findmnt`.
+   - If unmounted, locates the block device (or uses `-d <device>`).
+   - Mounts the partition to `/mnt/pocketcloud`.
+   - Adds the disk UUID to `/etc/fstab` (`defaults,noatime,nofail 0 2`) so it persists on boot.
+   - Creates `/mnt/pocketcloud/storage` and sets ownership to `neon:neon`.
+4. **Compiles Static Go Binaries**: Statically compiles `api-server` and `neon-ctl` for target Linux architecture.
+5. **Transfers Binaries & Installs**: Copies binaries to `/opt/neonservices/` on the server and symlinks `neon-ctl` into `/usr/local/bin`.
+6. **Configures Secrets**: If no `config.yaml` exists, generates a secure 256-bit JWT secret and writes configuration with `0600` permissions.
+7. **Installs Systemd Service**: Deploys `neonservices.service`, reloads systemd, and starts the service.
+8. **Runs Health Check**: Verifies `systemctl is-active` and tests `http://127.0.0.1:8080/api/v1/health`.
 
 ---
 
@@ -212,28 +198,6 @@ All protected endpoints require the header `Authorization: Bearer <token>`.
 
 ---
 
-## 🚢 Deploying to Ubuntu via SSH
-
-### Step 1: Initial Ubuntu Host Bootstrap
-Copy and run `deploy/setup-host.sh` on the Ubuntu target machine once:
-```bash
-scp -i ~/.ssh/id_ed25519 deploy/setup-host.sh ubuntu@<UBUNTU_IP>:~/
-ssh -i ~/.ssh/id_ed25519 ubuntu@<UBUNTU_IP> "sudo bash ~/setup-host.sh"
-```
-
-### Step 2: Automated Deployment from Workstation
-Edit `ssh` block in `config.yaml` or set environment variables:
-```bash
-export NEON_DEPLOY_HOST="192.168.1.100"
-export NEON_DEPLOY_USER="ubuntu"
-export NEON_DEPLOY_KEY="$HOME/.ssh/id_ed25519"
-
-make deploy
-```
-This automatically cross-compiles the static Linux binary (`bin/api-server-linux-amd64`), securely copies it via SCP, updates the systemd service, and restarts the service!
-
----
-
 ## 🐍 Python Companion Worker
 
 Run the companion Python service on the Ubuntu server or another machine:
@@ -247,20 +211,4 @@ export NEON_API_URL="http://localhost:8080"
 export NEON_WORKER_USER="admin"
 export NEON_WORKER_PASS="your-password"
 python nas_worker.py
-```
-
----
-
-## 📦 Uploading to Git
-
-To push this repository to GitHub or GitLab:
-
-```bash
-# Add files and make initial commit
-git add .
-git commit -m "feat: initial NeonServices multi-user platform with NAS integration"
-
-# Link your remote repository and push
-git remote add origin git@github.com:<your-user>/NeonServices.git
-git push -u origin main
 ```
