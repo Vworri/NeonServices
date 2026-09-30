@@ -13,6 +13,7 @@ NAS_MOUNT_POINT="/mnt/pocketcloud"
 NAS_DEVICE="" # Optional, e.g. /dev/sdb1 or /dev/nvme0n1p1
 REMOTE_INSTALL_DIR="/opt/neonservices"
 FORCE_FORMAT=false
+SKIP_MOUNT=false
 REMOTE_HOST=""
 
 usage() {
@@ -21,21 +22,27 @@ Usage:
   ./deploy/deploy-to-host.sh <IP_or_USER@IP> [options]
 
 Arguments:
-  <IP_or_USER@IP>         Target Ubuntu host (e.g., 192.168.1.100 or ubuntu@192.168.1.100)
+  <IP_or_USER@IP>         Target Ubuntu host (e.g., lab@192.168.3.54)
 
 Options:
   -u, --user <username>   SSH username (default: ubuntu)
   -p, --port <port>       SSH port (default: 22)
   -i, --key <key_path>    SSH private key (default: ~/.ssh/id_ed25519 or ~/.ssh/id_rsa)
   -m, --mount <path>      NAS mount point (default: /mnt/pocketcloud)
-  -d, --device <dev>      NAS block device/partition to mount (e.g., /dev/sdb1)
+  -d, --device <dev>      NAS block device/partition to mount (e.g., /dev/sdb1 or /dev/sdb)
   --format                Format the NAS device to ext4 if it has no filesystem
+  --skip-mount            Skip mounting block device (use existing directory or mount)
   -h, --help              Show this help message
 
 Examples:
-  ./deploy/deploy-to-host.sh 192.168.1.100
-  ./deploy/deploy-to-host.sh ubuntu@192.168.1.100 -i ~/.ssh/my_key
-  ./deploy/deploy-to-host.sh 192.168.1.100 -d /dev/sdb1 -m /mnt/pocketcloud
+  # Deploy using target IP and user:
+  ./deploy/deploy-to-host.sh lab@192.168.3.54
+
+  # Deploy and mount specific NAS drive:
+  ./deploy/deploy-to-host.sh lab@192.168.3.54 -d /dev/sdb1
+
+  # Deploy using local folder without mounting hardware disk:
+  ./deploy/deploy-to-host.sh lab@192.168.3.54 --skip-mount
 HELP
   exit 0
 }
@@ -44,14 +51,12 @@ if [ $# -lt 1 ]; then
   usage
 fi
 
-# Check for help flag first
 for arg in "$@"; do
   if [ "$arg" = "-h" ] || [ "$arg" = "--help" ]; then
     usage
   fi
 done
 
-# First non-flag argument is target
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -u|--user)
@@ -76,6 +81,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --format)
       FORCE_FORMAT=true
+      shift
+      ;;
+    --skip-mount)
+      SKIP_MOUNT=true
       shift
       ;;
     -*)
@@ -114,7 +123,16 @@ if [ -z "$SSH_KEY" ]; then
   fi
 fi
 
-SSH_OPTS=(-p "$SSH_PORT" -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
+# Create temporary directory for SSH socket multiplexing (enter password once)
+SOCKET_DIR=$(mktemp -d /tmp/neon-ssh-XXXXXX)
+SOCKET_PATH="$SOCKET_DIR/cm-%r@%h:%p"
+cleanup_socket() {
+  ssh -O exit -S "$SOCKET_PATH" "$SSH_USER@$REMOTE_HOST" 2>/dev/null || true
+  rm -rf "$SOCKET_DIR"
+}
+trap cleanup_socket EXIT
+
+SSH_OPTS=(-p "$SSH_PORT" -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o ControlMaster=auto -o ControlPath="$SOCKET_PATH" -o ControlPersist=5m)
 if [ -n "$SSH_KEY" ]; then
   SSH_OPTS+=(-i "$SSH_KEY")
 fi
@@ -124,7 +142,7 @@ run_ssh() {
 }
 
 run_scp() {
-  scp -P "$SSH_PORT" ${SSH_KEY:+-i "$SSH_KEY"} -o StrictHostKeyChecking=accept-new "$@"
+  scp -P "$SSH_PORT" ${SSH_KEY:+-i "$SSH_KEY"} -o StrictHostKeyChecking=accept-new -o ControlPath="$SOCKET_PATH" "$@"
 }
 
 echo "=================================================================="
@@ -167,63 +185,59 @@ set -euo pipefail
 MOUNT_POINT="$NAS_MOUNT_POINT"
 DEVICE="$NAS_DEVICE"
 FORCE_FMT="$FORCE_FORMAT"
+SKIP="$SKIP_MOUNT"
 STORAGE_DIR="\$MOUNT_POINT/storage"
 
-echo "[i] Checking if \$MOUNT_POINT is mounted..."
-if findmnt -M "\$MOUNT_POINT" >/dev/null 2>&1; then
+if [ "\$SKIP" = "true" ]; then
+  echo "[i] Skipping physical drive mount (--skip-mount specified)."
+  sudo mkdir -p "\$STORAGE_DIR"
+elif findmnt -M "\$MOUNT_POINT" >/dev/null 2>&1; then
   echo "[+] \$MOUNT_POINT is already mounted:"
-  findmnt -M "\$MOUNT_POINT" -o SOURCE,FSTYPE,SIZE,USED,AVAIL,TARGET
+  findmnt -M "\$MOUNT_POINT" -o SOURCE,FSTYPE,SIZE,USED,AVAIL,TARGET || true
 else
   echo "[!] \$MOUNT_POINT is NOT currently mounted."
 
   # If device not passed, attempt discovery of unmounted candidate drives
   if [ -z "\$DEVICE" ]; then
-    echo "[i] Searching for available unmounted disks/partitions..."
-    CANDIDATE=\$(lsblk -rpno NAME,TYPE,MOUNTPOINT,FSTYPE,SIZE,MODEL | awk '\$2=="part" && \$3=="" {print \$1; exit}')
+    echo "[i] Scanning for available block devices on host:"
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL || true
+
+    # Look for unmounted partition or disk (excluding loop/ram devices)
+    CANDIDATE=\$(lsblk -rpno NAME,TYPE,MOUNTPOINT | awk '\$2~/^(part|disk)$/ && \$3=="" && \$1!~/loop/ {print \$1; exit}' || true)
     if [ -n "\$CANDIDATE" ]; then
       DEVICE="\$CANDIDATE"
-      echo "[i] Auto-detected candidate unmounted partition: \$DEVICE"
+      echo "[i] Candidate unmounted drive detected: \$DEVICE"
     else
-      echo "[-] No unmounted partition auto-detected."
-      echo "    Available block devices on host:"
-      lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,VENDOR
-      echo "[-] Please specify device using: -d /dev/sdX1"
-      exit 1
+      echo "[!] No unmounted external partition auto-detected."
+      echo "[i] Using local directory at \$STORAGE_DIR for now."
+      echo "[i] You can attach the NAS drive later and run:"
+      echo "    ./deploy/deploy-to-host.sh $SSH_USER@$REMOTE_HOST -d /dev/sdX1"
+      sudo mkdir -p "\$STORAGE_DIR"
     fi
   fi
 
-  echo "[i] Inspecting block device \$DEVICE..."
-  if ! [ -b "\$DEVICE" ]; then
-    echo "[-] Device \$DEVICE does not exist!"
-    exit 1
-  fi
+  if [ -n "\$DEVICE" ]; then
+    echo "[i] Checking block device \$DEVICE..."
+    if [ -b "\$DEVICE" ]; then
+      CURRENT_FS=\$(blkid -s TYPE -o value "\$DEVICE" || true)
+      if [ -z "\$CURRENT_FS" ]; then
+        if [ "\$FORCE_FMT" = "true" ]; then
+          echo "[!] Formatting \$DEVICE to ext4..."
+          sudo mkfs.ext4 -F -L "PocketCloud" "\$DEVICE"
+        else
+          echo "[-] Warning: \$DEVICE has no filesystem. Re-run with --format to format."
+        fi
+      fi
 
-  CURRENT_FS=\$(blkid -s TYPE -o value "\$DEVICE" || true)
-  if [ -z "\$CURRENT_FS" ]; then
-    if [ "\$FORCE_FMT" = "true" ]; then
-      echo "[!] Formatting \$DEVICE to ext4..."
-      sudo mkfs.ext4 -F -L "PocketCloud" "\$DEVICE"
-    else
-      echo "[-] Device \$DEVICE has no filesystem. Re-run with --format to format as ext4."
-      exit 1
-    fi
-  else
-    echo "[+] Found filesystem '\$CURRENT_FS' on \$DEVICE."
-  fi
-
-  # Create mount directory
-  sudo mkdir -p "\$MOUNT_POINT"
-
-  # Mount device
-  echo "[+] Mounting \$DEVICE to \$MOUNT_POINT..."
-  sudo mount "\$DEVICE" "\$MOUNT_POINT"
-
-  # Add to /etc/fstab if not already present (using nofail so server reboots safely)
-  DEV_UUID=\$(blkid -s UUID -o value "\$DEVICE" || true)
-  if [ -n "\$DEV_UUID" ]; then
-    if ! grep -q "\$DEV_UUID" /etc/fstab; then
-      echo "[+] Adding persistent mount to /etc/fstab (UUID=\$DEV_UUID)..."
-      echo "UUID=\$DEV_UUID \$MOUNT_POINT ext4 defaults,noatime,nofail 0 2" | sudo tee -a /etc/fstab
+      sudo mkdir -p "\$MOUNT_POINT"
+      if [ -n "\$(blkid -s TYPE -o value "\$DEVICE" || true)" ]; then
+        echo "[+] Mounting \$DEVICE to \$MOUNT_POINT..."
+        sudo mount "\$DEVICE" "\$MOUNT_POINT" || true
+        DEV_UUID=\$(blkid -s UUID -o value "\$DEVICE" || true)
+        if [ -n "\$DEV_UUID" ] && ! grep -q "\$DEV_UUID" /etc/fstab; then
+          echo "UUID=\$DEV_UUID \$MOUNT_POINT ext4 defaults,noatime,nofail 0 2" | sudo tee -a /etc/fstab
+        fi
+      fi
     fi
   fi
 fi
@@ -240,7 +254,7 @@ fi
 # Set ownership and permissions for neon service
 sudo chown -R neon:neon "\$STORAGE_DIR"
 sudo chmod 775 "\$STORAGE_DIR"
-echo "[+] NAS storage directory ready at \$STORAGE_DIR"
+echo "[+] Storage directory verified: \$STORAGE_DIR"
 REMOTE_EOF
 )
 
@@ -274,8 +288,6 @@ MOUNT="$NAS_MOUNT_POINT/storage"
 
 if [ ! -f "\$DIR/config.yaml" ]; then
   echo "[+] Generating initial production config.yaml..."
-  
-  # Generate a 256-bit secure secret
   JWT_SECRET=\$(head -c 32 /dev/urandom | xxd -p -c 32 2>/dev/null || openssl rand -hex 32 2>/dev/null || tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 64)
   
   cat << YAML_EOF > "\$DIR/config.yaml"
@@ -345,7 +357,7 @@ echo "    Response: $HEALTH_CHECK"
 
 echo ""
 echo "=================================================================="
-echo " 🎉 Deployment and NAS Provisioning Complete!"
+echo " 🎉 Deployment Complete!"
 echo "=================================================================="
 echo " - Remote API Base:    http://$REMOTE_HOST:8080/api/v1"
 echo " - NAS Storage Path:   $NAS_MOUNT_POINT/storage"
