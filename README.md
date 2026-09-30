@@ -26,7 +26,7 @@ graph TD
         subgraph StationPC PocketCloud NAS
             NASMount["/mnt/pocketcloud/storage"]
             UserA["/users/alice/..."]
-            UserB["/users/bob/..."]
+            UserB["/users/bob/..."] 
         end
     end
 
@@ -46,6 +46,11 @@ graph TD
 ## ✨ Features
 
 - **Multi-Tenant User Authentication**: Secure registration, login, role-based access control (Admin / User), and bcrypt password hashing with JWT Bearer tokens.
+- **reTerminal E1001 OpenDisplay Service**:
+  - Purpose-built for the Seeed Studio reTerminal E1001 (7.5" 800×480 e-Paper display).
+  - High-visibility typography: large digital clock, local weather (temp, high/low, conditions, humidity, wind), air quality index (AQI & PM2.5), and upcoming calendar events.
+  - Intelligent partial refresh engine: detects when only time changes and signals `X-Refresh-Type: partial` (no screen flicker). Triggers periodic full refreshes to clear ghosting.
+  - Configurable via the Fyne desktop app, CLI, and REST API per user/device.
 - **StationPC PocketCloud NAS Storage Engine**:
   - Live capacity monitoring (total, free, used bytes, percentage).
   - Isolated per-user storage sandboxes (`/mnt/pocketcloud/storage/users/{username}`).
@@ -166,6 +171,46 @@ go run ./cmd/fyne-manager
 # Check StationPC PocketCloud NAS mount status
 ./bin/neon-ctl nas-status
 ```
+
+---
+
+## 🖥️ Seeed Studio reTerminal E1001 OpenDisplay Service
+
+The service generates an 800×480 monochrome e-Paper dashboard optimized for the 7.5" screen on the **Seeed Studio reTerminal E1001**:
+
+```
++--------------------------------------------------------------------------------+
+| reTerminal E1001 • OpenDisplay [reterminal-01]            [PARTIAL • 13:50:00] |
++----------------------------------------------------+---------------------------+
+|                                                    | WEATHER • New York, NY    |
+|   10:45 AM                                         |  72°F   Partly Cloudy     |
+|                                                    |         H: 78°  L: 62°    |
+|   WEDNESDAY                                        |         Humidity: 55%     |
+|   September 30, 2026                               |---------------------------|
+|   📍 New York, NY                                  | AIR QUALITY INDEX (AQI)   |
+|                                                    |  AQI 32 • GOOD            |
+|                                                    |  PM2.5: 7.8 µg/m³         |
++----------------------------------------------------+---------------------------+
+| 📅 UPCOMING SCHEDULE & CALENDAR EVENTS                                         |
+|  • 14:00 - 15:00   Team Architecture Review  (Zoom Room 1)                     |
+|  • 16:30 - 17:30   reTerminal E1001 Deploy   (Lab Office)                      |
++--------------------------------------------------------------------------------+
+```
+
+### Display Endpoints
+| URL | Description |
+|---|---|
+| `GET /api/v1/display/{device_id}/image.png` | 800×480 PNG for OpenDisplay WiFi firmware |
+| `GET /api/v1/display/{device_id}/image.bmp` | 800×480 BMP format |
+| `GET /api/v1/display/{device_id}/image.raw` | 1-bit packed monochrome buffer (48,000 bytes) |
+| `GET /api/v1/display/{device_id}/status` | JSON payload with data and refresh interval |
+| `POST /api/v1/display/{device_id}/config` | Update device location, timezone & calendar |
+| `POST /api/v1/display/{device_id}/events` | Add quick calendar event to the display |
+
+### OpenDisplay HTTP Headers
+Every image request returns headers consumed by OpenDisplay firmware:
+- `X-Refresh-Type: partial` (fast refresh, no flashing) or `full` (complete e-ink refresh)
+- `X-Next-Poll-Seconds: 60` (or configured interval)
 
 ---
 

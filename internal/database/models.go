@@ -30,3 +30,26 @@ type AuditLog struct {
 	Details   string    `json:"details"`
 	CreatedAt time.Time `json:"created_at"`
 }
+
+type DisplayConfig struct {
+	DeviceID              string    `json:"device_id"`
+	UserID                int64     `json:"user_id"`
+	CityName              string    `json:"city_name"`
+	Latitude              float64   `json:"latitude"`
+	Longitude             float64   `json:"longitude"`
+	Timezone              string    `json:"timezone"`
+	CalendarURL           string    `json:"calendar_url"`
+	FullRefreshMinutes    int       `json:"full_refresh_minutes"`
+	PartialRefreshMinutes int       `json:"partial_refresh_minutes"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
+}
+
+type CalendarEvent struct {
+	ID        int64     `json:"id"`
+	DeviceID  string    `json:"device_id"`
+	Title     string    `json:"title"`
+	StartTime time.Time `json:"start_time"`
+	EndTime   time.Time `json:"end_time"`
+	Location  string    `json:"location,omitempty"`
+}

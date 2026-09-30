@@ -25,6 +25,18 @@ import (
 )
 
 type ManagerApp struct {
+	// reTerminal Display Fields
+	displayDeviceIDEntry      *widget.Entry
+	displayUserIDEntry        *widget.Entry
+	displayCityEntry          *widget.Entry
+	displayLatEntry           *widget.Entry
+	displayLonEntry           *widget.Entry
+	displayTimezoneEntry      *widget.Entry
+	displayCalURLEntry        *widget.Entry
+	displayFullRefreshEntry   *widget.Entry
+	displayPartialRefreshEntry *widget.Entry
+	displayUrlLabel           *widget.Label
+
 	window    fyne.Window
 	sshClient *sshutil.Client
 
@@ -69,6 +81,7 @@ func (m *ManagerApp) buildUI() fyne.CanvasObject {
 		container.NewTabItemWithIcon("Secrets & Config", theme.DocumentCreateIcon(), m.buildConfigTab()),
 		container.NewTabItemWithIcon("Service & Logs", theme.ViewRefreshIcon(), m.buildServiceTab()),
 		container.NewTabItemWithIcon("NAS & Storage", theme.StorageIcon(), m.buildNASTab()),
+		container.NewTabItemWithIcon("reTerminal E1001", theme.VisibilityIcon(), m.buildDisplayTab()),
 	)
 	tabs.SetTabLocation(container.TabLocationTop)
 
@@ -396,4 +409,175 @@ func (m *ManagerApp) buildNASTab() fyne.CanvasObject {
 		inspectBtn,
 		m.nasStatusText,
 	)
+}
+
+func (m *ManagerApp) buildDisplayTab() fyne.CanvasObject {
+	m.displayDeviceIDEntry = widget.NewEntry()
+	m.displayDeviceIDEntry.SetText("reterminal-01")
+
+	m.displayUserIDEntry = widget.NewEntry()
+	m.displayUserIDEntry.SetText("1")
+
+	m.displayCityEntry = widget.NewEntry()
+	m.displayCityEntry.SetText("New York, NY")
+
+	m.displayLatEntry = widget.NewEntry()
+	m.displayLatEntry.SetText("40.7128")
+
+	m.displayLonEntry = widget.NewEntry()
+	m.displayLonEntry.SetText("-74.0060")
+
+	m.displayTimezoneEntry = widget.NewEntry()
+	m.displayTimezoneEntry.SetText("America/New_York")
+
+	m.displayCalURLEntry = widget.NewEntry()
+	m.displayCalURLEntry.SetPlaceHolder("https://calendar.google.com/calendar/ical/.../basic.ics")
+
+	m.displayFullRefreshEntry = widget.NewEntry()
+	m.displayFullRefreshEntry.SetText("30")
+
+	m.displayPartialRefreshEntry = widget.NewEntry()
+	m.displayPartialRefreshEntry.SetText("1")
+
+	m.displayUrlLabel = widget.NewLabel("reTerminal Target URL: http://" + m.hostEntry.Text + ":8080/api/v1/display/reterminal-01/image.png")
+	m.displayUrlLabel.Wrapping = fyne.TextWrapWord
+
+	m.displayDeviceIDEntry.OnChanged = func(s string) {
+		m.displayUrlLabel.SetText("reTerminal Target URL: http://" + m.hostEntry.Text + ":8080/api/v1/display/" + s + "/image.png")
+	}
+
+	saveBtn := widget.NewButtonWithIcon("Save & Push to reTerminal", theme.DocumentSaveIcon(), func() {
+		m.saveDisplayConfig()
+	})
+	saveBtn.Importance = widget.HighImportance
+
+	fetchBtn := widget.NewButtonWithIcon("Fetch Current Config", theme.DownloadIcon(), func() {
+		m.fetchDisplayConfig()
+	})
+
+	previewBtn := widget.NewButtonWithIcon("Preview 800x480 Layout", theme.VisibilityIcon(), func() {
+		m.previewDisplay()
+	})
+
+	addEventBtn := widget.NewButtonWithIcon("Add Calendar Event", theme.ContentAddIcon(), func() {
+		m.showAddEventDialog()
+	})
+
+	form := widget.NewForm(
+		widget.NewFormItem("Device ID", m.displayDeviceIDEntry),
+		widget.NewFormItem("Associated User ID", m.displayUserIDEntry),
+		widget.NewFormItem("City / Location Name", m.displayCityEntry),
+		widget.NewFormItem("Latitude", m.displayLatEntry),
+		widget.NewFormItem("Longitude", m.displayLonEntry),
+		widget.NewFormItem("Timezone", m.displayTimezoneEntry),
+		widget.NewFormItem("iCal Calendar Feed URL", m.displayCalURLEntry),
+		widget.NewFormItem("Full Refresh Interval (Minutes)", m.displayFullRefreshEntry),
+		widget.NewFormItem("Partial Refresh Interval (Minutes)", m.displayPartialRefreshEntry),
+	)
+
+	btnRow := container.NewHBox(saveBtn, fetchBtn, previewBtn, addEventBtn)
+
+	headerDesc := widget.NewLabel("Configure the 7.5" 800x480 e-Paper display for Seeed Studio reTerminal E1001 OpenDisplay.")
+	headerDesc.Wrapping = fyne.TextWrapWord
+
+	return container.NewVBox(
+		headerDesc,
+		form,
+		btnRow,
+		widget.NewSeparator(),
+		m.displayUrlLabel,
+	)
+}
+
+func (m *ManagerApp) saveDisplayConfig() {
+	lat, _ := strconv.ParseFloat(m.displayLatEntry.Text, 64)
+	lon, _ := strconv.ParseFloat(m.displayLonEntry.Text, 64)
+	fullRef, _ := strconv.Atoi(m.displayFullRefreshEntry.Text)
+	partRef, _ := strconv.Atoi(m.displayPartialRefreshEntry.Text)
+	uid, _ := strconv.ParseInt(m.displayUserIDEntry.Text, 10, 64)
+	if uid <= 0 {
+		uid = 1
+	}
+
+	payload := fmt.Sprintf(`{"user_id":%d,"city_name":%q,"latitude":%f,"longitude":%f,"timezone":%q,"calendar_url":%q,"full_refresh_minutes":%d,"partial_refresh_minutes":%d}`,
+		uid, m.displayCityEntry.Text, lat, lon, m.displayTimezoneEntry.Text, m.displayCalURLEntry.Text, fullRef, partRef,
+	)
+
+	host := m.hostEntry.Text
+	url := fmt.Sprintf("http://%s:8080/api/v1/display/%s/config", host, m.displayDeviceIDEntry.Text)
+
+	go func() {
+		// Use SSH or direct HTTP
+		var cmd string
+		if m.sshClient != nil {
+			cmd = fmt.Sprintf("curl -s -X POST -H 'Content-Type: application/json' -d %q http://127.0.0.1:8080/api/v1/display/%s/config",
+				payload, m.displayDeviceIDEntry.Text)
+			out, err := m.sshClient.Run(cmd)
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("Failed to update config: %v\n%s", err, out), m.window)
+				return
+			}
+		}
+		dialog.ShowInformation("Configuration Updated", fmt.Sprintf("Display config successfully saved for device %q!\nURL: %s", m.displayDeviceIDEntry.Text, url), m.window)
+	}()
+}
+
+func (m *ManagerApp) fetchDisplayConfig() {
+	if m.sshClient == nil {
+		dialog.ShowInformation("Not Connected", "Please connect via SSH first to query the server.", m.window)
+		return
+	}
+	devID := m.displayDeviceIDEntry.Text
+	go func() {
+		cmd := fmt.Sprintf("curl -s http://127.0.0.1:8080/api/v1/display/%s/config", devID)
+		out, err := m.sshClient.Run(cmd)
+		if err != nil {
+			dialog.ShowError(err, m.window)
+			return
+		}
+		dialog.ShowInformation("Display Config", out, m.window)
+	}()
+}
+
+func (m *ManagerApp) previewDisplay() {
+	host := m.hostEntry.Text
+	devID := m.displayDeviceIDEntry.Text
+	url := fmt.Sprintf("http://%s:8080/api/v1/display/%s/image.png", host, devID)
+
+	dialog.ShowInformation("reTerminal E1001 Preview",
+		fmt.Sprintf("e-Paper Display URL for OpenDisplay:\n\n%s\n\nOpen this in your browser to inspect the rendered 800x480 dashboard.", url),
+		m.window,
+	)
+}
+
+func (m *ManagerApp) showAddEventDialog() {
+	devID := m.displayDeviceIDEntry.Text
+	titleEntry := widget.NewEntry()
+	titleEntry.SetPlaceHolder("e.g. Project Demo")
+	locEntry := widget.NewEntry()
+	locEntry.SetPlaceHolder("e.g. Lab Office")
+
+	items := []*widget.FormItem{
+		widget.NewFormItem("Event Title", titleEntry),
+		widget.NewFormItem("Location", locEntry),
+	}
+
+	dialog.ShowForm("Add Calendar Event", "Create Event", "Cancel", items, func(confirmed bool) {
+		if !confirmed || titleEntry.Text == "" {
+			return
+		}
+		now := time.Now()
+		payload := fmt.Sprintf(`{"title":%q,"start_time":%q,"end_time":%q,"location":%q}`,
+			titleEntry.Text, now.Format(time.RFC3339), now.Add(1*time.Hour).Format(time.RFC3339), locEntry.Text,
+		)
+
+		if m.sshClient != nil {
+			cmd := fmt.Sprintf("curl -s -X POST -H 'Content-Type: application/json' -d %q http://127.0.0.1:8080/api/v1/display/%s/events",
+				payload, devID)
+			go func() {
+				_, _ = m.sshClient.Run(cmd)
+				dialog.ShowInformation("Event Added", "Calendar event created on reTerminal dashboard.", m.window)
+			}()
+		}
+	}, m.window)
 }

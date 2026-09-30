@@ -75,6 +75,29 @@ func (db *DB) migrate() error {
 		details TEXT,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
+	CREATE TABLE IF NOT EXISTS display_configs (
+		device_id TEXT PRIMARY KEY,
+		user_id INTEGER NOT NULL,
+		city_name TEXT NOT NULL DEFAULT 'New York',
+		latitude REAL NOT NULL DEFAULT 40.7128,
+		longitude REAL NOT NULL DEFAULT -74.0060,
+		timezone TEXT NOT NULL DEFAULT 'Local',
+		calendar_url TEXT NOT NULL DEFAULT '',
+		full_refresh_minutes INTEGER NOT NULL DEFAULT 30,
+		partial_refresh_minutes INTEGER NOT NULL DEFAULT 1,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS calendar_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		device_id TEXT NOT NULL,
+		title TEXT NOT NULL,
+		start_time DATETIME NOT NULL,
+		end_time DATETIME NOT NULL,
+		location TEXT,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
 	`
 	_, err := db.conn.Exec(schema)
 	return err
@@ -195,4 +218,118 @@ func (db *DB) LogAudit(log *AuditLog) error {
 	`
 	_, err := db.conn.Exec(query, log.UserID, log.Username, log.Action, log.IPAddress, log.Details)
 	return err
+}
+
+// Display and Calendar database methods
+
+func (db *DB) SaveDisplayConfig(cfg *DisplayConfig) error {
+	query := `
+	INSERT INTO display_configs (device_id, user_id, city_name, latitude, longitude, timezone, calendar_url, full_refresh_minutes, partial_refresh_minutes, created_at, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+	ON CONFLICT(device_id) DO UPDATE SET
+		user_id = excluded.user_id,
+		city_name = excluded.city_name,
+		latitude = excluded.latitude,
+		longitude = excluded.longitude,
+		timezone = excluded.timezone,
+		calendar_url = excluded.calendar_url,
+		full_refresh_minutes = excluded.full_refresh_minutes,
+		partial_refresh_minutes = excluded.partial_refresh_minutes,
+		updated_at = CURRENT_TIMESTAMP
+	`
+	_, err := db.conn.Exec(query,
+		cfg.DeviceID, cfg.UserID, cfg.CityName, cfg.Latitude, cfg.Longitude,
+		cfg.Timezone, cfg.CalendarURL, cfg.FullRefreshMinutes, cfg.PartialRefreshMinutes,
+	)
+	return err
+}
+
+func (db *DB) GetDisplayConfig(deviceID string) (*DisplayConfig, error) {
+	query := `
+	SELECT device_id, user_id, city_name, latitude, longitude, timezone, calendar_url, full_refresh_minutes, partial_refresh_minutes, created_at, updated_at
+	FROM display_configs WHERE device_id = ?
+	`
+	var c DisplayConfig
+	err := db.conn.QueryRow(query, deviceID).Scan(
+		&c.DeviceID, &c.UserID, &c.CityName, &c.Latitude, &c.Longitude,
+		&c.Timezone, &c.CalendarURL, &c.FullRefreshMinutes, &c.PartialRefreshMinutes,
+		&c.CreatedAt, &c.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil // not found
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (db *DB) ListDisplayConfigs(userID int64) ([]DisplayConfig, error) {
+	query := `
+	SELECT device_id, user_id, city_name, latitude, longitude, timezone, calendar_url, full_refresh_minutes, partial_refresh_minutes, created_at, updated_at
+	FROM display_configs WHERE user_id = ? ORDER BY device_id ASC
+	`
+	rows, err := db.conn.Query(query, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []DisplayConfig
+	for rows.Next() {
+		var c DisplayConfig
+		if err := rows.Scan(
+			&c.DeviceID, &c.UserID, &c.CityName, &c.Latitude, &c.Longitude,
+			&c.Timezone, &c.CalendarURL, &c.FullRefreshMinutes, &c.PartialRefreshMinutes,
+			&c.CreatedAt, &c.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		list = append(list, c)
+	}
+	return list, rows.Err()
+}
+
+func (db *DB) AddCalendarEvent(event *CalendarEvent) error {
+	query := `
+	INSERT INTO calendar_events (device_id, title, start_time, end_time, location, created_at)
+	VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	`
+	res, err := db.conn.Exec(query, event.DeviceID, event.Title, event.StartTime, event.EndTime, event.Location)
+	if err != nil {
+		return err
+	}
+	id, err := res.LastInsertId()
+	if err == nil {
+		event.ID = id
+	}
+	return nil
+}
+
+func (db *DB) GetUpcomingCalendarEvents(deviceID string, limit int) ([]CalendarEvent, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	query := `
+	SELECT id, device_id, title, start_time, end_time, location
+	FROM calendar_events
+	WHERE device_id = ? AND end_time >= datetime('now', '-1 hour')
+	ORDER BY start_time ASC
+	LIMIT ?
+	`
+	rows, err := db.conn.Query(query, deviceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []CalendarEvent
+	for rows.Next() {
+		var e CalendarEvent
+		if err := rows.Scan(&e.ID, &e.DeviceID, &e.Title, &e.StartTime, &e.EndTime, &e.Location); err != nil {
+			return nil, err
+		}
+		events = append(events, e)
+	}
+	return events, rows.Err()
 }

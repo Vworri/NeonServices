@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/neonphnx/NeonServices/internal/config"
 	"github.com/neonphnx/NeonServices/internal/sshutil"
@@ -26,6 +27,70 @@ func main() {
 	command := os.Args[1]
 
 	switch command {
+	case "display-status":
+		deviceID := "reterminal-01"
+		if len(os.Args) >= 3 {
+			deviceID = os.Args[2]
+		}
+		client := getClient(cfg)
+		defer client.Close()
+		_ = client.Connect()
+		out, err := client.Run(fmt.Sprintf("curl -s http://127.0.0.1:8080/api/v1/display/%s/status", deviceID))
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("reTerminal Status [%s]:\n%s\n", deviceID, out)
+
+	case "display-config":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: neon-ctl display-config <device_id> [city] [lat] [lon]")
+			os.Exit(1)
+		}
+		deviceID := os.Args[2]
+		client := getClient(cfg)
+		defer client.Close()
+		_ = client.Connect()
+
+		if len(os.Args) >= 6 {
+			city := os.Args[3]
+			lat := os.Args[4]
+			lon := os.Args[5]
+			payload := fmt.Sprintf(`{"user_id":1,"city_name":"%s","latitude":%s,"longitude":%s,"timezone":"America/New_York","full_refresh_minutes":30,"partial_refresh_minutes":1}`, city, lat, lon)
+			out, err := client.Run(fmt.Sprintf("curl -s -X POST -H 'Content-Type: application/json' -d '%s' http://127.0.0.1:8080/api/v1/display/%s/config", payload, deviceID))
+			if err != nil {
+				fmt.Printf("Error saving config: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("Updated config for %s:\n%s\n", deviceID, out)
+		} else {
+			out, _ := client.Run(fmt.Sprintf("curl -s http://127.0.0.1:8080/api/v1/display/%s/config", deviceID))
+			fmt.Printf("Config for %s:\n%s\n", deviceID, out)
+		}
+
+	case "display-event":
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: neon-ctl display-event <device_id> <title> [location]")
+			os.Exit(1)
+		}
+		deviceID := os.Args[2]
+		title := os.Args[3]
+		loc := ""
+		if len(os.Args) >= 5 {
+			loc = os.Args[4]
+		}
+		client := getClient(cfg)
+		defer client.Close()
+		_ = client.Connect()
+		payload := fmt.Sprintf(`{"title":"%s","location":"%s","start_time":"%s","end_time":"%s"}`,
+			title, loc, time.Now().Format(time.RFC3339), time.Now().Add(1*time.Hour).Format(time.RFC3339))
+		out, err := client.Run(fmt.Sprintf("curl -s -X POST -H 'Content-Type: application/json' -d '%s' http://127.0.0.1:8080/api/v1/display/%s/events", payload, deviceID))
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Added event to %s:\n%s\n", deviceID, out)
+
 	case "gen-secret":
 		bytes := make([]byte, 32)
 		if _, err := rand.Read(bytes); err != nil {
@@ -172,5 +237,8 @@ Commands:
   logs          Show recent remote systemd journal logs
   nas-status    Inspect StationPC PocketCloud NAS mount status and capacity
   gen-secret    Generate a high-entropy 256-bit hexadecimal secret key
+  display-status <id>                  Query reTerminal E1001 status & refresh type
+  display-config <id> [city] [lat] [lon] Configure location & settings for display
+  display-event  <id> <title> [loc]     Add a calendar event to the display
 `)
 }

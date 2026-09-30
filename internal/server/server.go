@@ -10,6 +10,7 @@ import (
 	"github.com/neonphnx/NeonServices/internal/auth"
 	"github.com/neonphnx/NeonServices/internal/config"
 	"github.com/neonphnx/NeonServices/internal/database"
+	"github.com/neonphnx/NeonServices/internal/display"
 	"github.com/neonphnx/NeonServices/internal/handlers"
 	"github.com/neonphnx/NeonServices/internal/storage"
 )
@@ -18,6 +19,7 @@ type Server struct {
 	cfg        *config.Config
 	db         *database.DB
 	storageMgr *storage.Manager
+	displaySvc *display.Service
 	httpServer *http.Server
 }
 
@@ -26,6 +28,7 @@ func New(cfg *config.Config, db *database.DB, sm *storage.Manager) *Server {
 		cfg:        cfg,
 		db:         db,
 		storageMgr: sm,
+		displaySvc: display.NewService(db),
 	}
 
 	mux := http.NewServeMux()
@@ -82,6 +85,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// Admin routes
 	mux.Handle("GET /api/v1/admin/users", authMiddleware(adminMiddleware(http.HandlerFunc(adminHandler.ListUsers))))
 	mux.Handle("GET /api/v1/admin/system", authMiddleware(adminMiddleware(http.HandlerFunc(adminHandler.SystemHealth))))
+
+	// reTerminal E1001 OpenDisplay Routes (public endpoints so reTerminal can fetch without complex certs, or token-authenticated)
+	s.displaySvc.RegisterRoutes(mux)
 }
 
 func (s *Server) Start() error {
