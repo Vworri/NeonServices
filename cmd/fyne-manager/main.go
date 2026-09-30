@@ -382,14 +382,6 @@ func (m *ManagerApp) showChangePasswordDialog() {
 // ==============================================================================
 
 func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
-	m.deviceSelect = widget.NewSelect([]string{"reterminal-01"}, func(s string) {
-		if s != "" && s != "(New Device)" {
-			m.displayDeviceIDEntry.SetText(s)
-			m.fetchDisplayConfigFor(s)
-		}
-	})
-	m.deviceSelect.SetSelected("reterminal-01")
-
 	m.displayDeviceIDEntry = widget.NewEntry()
 	m.displayDeviceIDEntry.SetText("reterminal-01")
 
@@ -418,8 +410,18 @@ func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
 	m.displayUrlLabel.Wrapping = fyne.TextWrapWord
 
 	m.displayDeviceIDEntry.OnChanged = func(s string) {
-		m.displayUrlLabel.SetText("reTerminal OpenDisplay URL: " + m.apiBaseURL + "/api/v1/display/" + s + "/image.png")
+		if m.displayUrlLabel != nil {
+			m.displayUrlLabel.SetText("reTerminal OpenDisplay URL: " + m.apiBaseURL + "/api/v1/display/" + s + "/image.png")
+		}
 	}
+
+	m.deviceSelect = widget.NewSelect([]string{"reterminal-01"}, func(s string) {
+		if s != "" && s != "(New Device)" && m.displayDeviceIDEntry != nil {
+			m.displayDeviceIDEntry.SetText(s)
+			m.fetchDisplayConfigFor(s)
+		}
+	})
+	m.deviceSelect.SetSelected("reterminal-01")
 
 	saveBtn := widget.NewButtonWithIcon("Save Device Config", theme.DocumentSaveIcon(), func() {
 		m.saveDisplayDevice()
