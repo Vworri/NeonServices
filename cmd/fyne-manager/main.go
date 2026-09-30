@@ -22,6 +22,9 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"net/url"
+
+	"github.com/neonphnx/NeonServices/internal/ble"
 	"github.com/neonphnx/NeonServices/internal/config"
 	"github.com/neonphnx/NeonServices/internal/database"
 	"github.com/neonphnx/NeonServices/internal/sshutil"
@@ -598,11 +601,17 @@ func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
 		m.showEasySetupGuide()
 	})
 
+	bleBtn := widget.NewButtonWithIcon("Bluetooth (BLE) Setup", theme.RadioButtonCheckedIcon(), func() {
+		m.showBluetoothWizard()
+	})
+	bleBtn.Importance = widget.HighImportance
+
 	topSelectorRow := container.NewHBox(
 		widget.NewLabelWithStyle("My Devices:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		m.deviceSelect,
 		refreshDevicesBtn,
 		deleteDeviceBtn,
+		bleBtn,
 		howToBtn,
 	)
 
@@ -1736,4 +1745,137 @@ This automatically installs the refresh service and connects it to NeonServices.
 		widget.NewLabel(opt2),
 	)
 	showWideDialog("reTerminal E1001 Quick Setup", "Close", "", box, 640, 360, m.window, func(bool) {})
+}
+
+
+func (m *ManagerApp) showBluetoothWizard() {
+	statusLabel := widget.NewLabel("Scanning Bluetooth controller...")
+	deviceSelect := widget.NewSelect([]string{"Scanning..."}, nil)
+	macToName := make(map[string]string)
+
+	wifiSSIDEntry := widget.NewEntry()
+	wifiSSIDEntry.SetPlaceHolder("Your Wi-Fi Network Name")
+	wifiPassEntry := widget.NewPasswordEntry()
+	wifiPassEntry.SetPlaceHolder("Wi-Fi Password")
+	targetURLEntry := widget.NewEntry()
+	targetURLEntry.SetText(m.apiBaseURL + "/screen")
+
+	refreshScan := func() {
+		statusLabel.SetText("Scanning nearby Bluetooth devices...")
+		go func() {
+			devices, err := ble.ScanAndDiscover(3)
+			fyne.Do(func() {
+				if err != nil {
+					statusLabel.SetText("BLE Error: " + err.Error())
+					return
+				}
+				var options []string
+				selected := ""
+				for _, d := range devices {
+					label := fmt.Sprintf("%s (%s)", d.Name, d.MAC)
+					if d.IsOpenDisplay {
+						label = "⚡ " + label + " [reTerminal OpenDisplay]"
+						selected = label
+					}
+					macToName[label] = d.MAC
+					options = append(options, label)
+				}
+				if len(options) == 0 {
+					options = []string{"(No devices found - check device power)"}
+				}
+				deviceSelect.Options = options
+				if selected != "" {
+					deviceSelect.SetSelected(selected)
+					statusLabel.SetText("Detected reTerminal OpenDisplay device ready for programming!")
+				} else if len(options) > 0 {
+					deviceSelect.SetSelected(options[0])
+					statusLabel.SetText(fmt.Sprintf("Discovered %d Bluetooth devices.", len(devices)))
+				}
+				deviceSelect.Refresh()
+			})
+		}()
+	}
+
+	scanBtn := widget.NewButtonWithIcon("Re-Scan BLE", theme.ViewRefreshIcon(), func() {
+		refreshScan()
+	})
+
+	connectBtn := widget.NewButtonWithIcon("Connect / Pair", theme.LoginIcon(), func() {
+		mac := macToName[deviceSelect.Selected]
+		if mac == "" {
+			dialog.ShowInformation("No Device Selected", "Please select a Bluetooth device from the list.", m.window)
+			return
+		}
+		statusLabel.SetText("Connecting to " + mac + "...")
+		go func() {
+			err := ble.ConnectDevice(mac)
+			fyne.Do(func() {
+				if err != nil {
+					statusLabel.SetText("Connect error: " + err.Error())
+					dialog.ShowError(err, m.window)
+				} else {
+					statusLabel.SetText("Successfully paired & connected to " + mac + "!")
+					dialog.ShowInformation("Connected", "Bluetooth connection established with "+mac, m.window)
+				}
+			})
+		}()
+	})
+
+	programBtn := widget.NewButtonWithIcon("Program Device via BLE", theme.DocumentSaveIcon(), func() {
+		mac := macToName[deviceSelect.Selected]
+		if mac == "" {
+			dialog.ShowInformation("No Device", "Please select a Bluetooth device.", m.window)
+			return
+		}
+		if wifiSSIDEntry.Text == "" {
+			dialog.ShowInformation("Wi-Fi Required", "Please enter the Wi-Fi network name.", m.window)
+			return
+		}
+		statusLabel.SetText("Flashing configuration over BLE...")
+		go func() {
+			out, err := ble.ProvisionOpenDisplay(mac, wifiSSIDEntry.Text, wifiPassEntry.Text, targetURLEntry.Text)
+			fyne.Do(func() {
+				if err != nil {
+					statusLabel.SetText("Provisioning error: " + err.Error())
+					dialog.ShowError(err, m.window)
+				} else {
+					statusLabel.SetText("Provisioning complete! Device is updating.")
+					dialog.ShowInformation("Success", "Configuration written to reTerminal over Bluetooth!\nOutput:\n"+out, m.window)
+				}
+			})
+		}()
+	})
+	programBtn.Importance = widget.HighImportance
+
+	webToolboxBtn := widget.NewButtonWithIcon("Open Web Bluetooth Toolbox (Browser)", theme.NavigateNextIcon(), func() {
+		m.window.Clipboard().SetContent(targetURLEntry.Text)
+		u, _ := url.Parse("https://opendisplay.org/toolbox/")
+		_ = fyne.CurrentApp().OpenURL(u)
+		dialog.ShowInformation("Web Bluetooth", "Opening OpenDisplay Web Bluetooth Toolbox in your browser.\nYour Image URL has been copied to your clipboard so you can paste it into the Web Bluetooth portal!", m.window)
+	})
+
+	copyUrlBtn := widget.NewButtonWithIcon("Copy Target URL", theme.ContentCopyIcon(), func() {
+		m.window.Clipboard().SetContent(targetURLEntry.Text)
+		dialog.ShowInformation("Copied", "Image URL copied to clipboard: "+targetURLEntry.Text, m.window)
+	})
+
+	form := widget.NewForm(
+		widget.NewFormItem("Target Device", container.NewBorder(nil, nil, nil, container.NewHBox(scanBtn, connectBtn), deviceSelect)),
+		widget.NewFormItem("Wi-Fi SSID", wifiSSIDEntry),
+		widget.NewFormItem("Wi-Fi Password", wifiPassEntry),
+		widget.NewFormItem("Image URL to Flash", container.NewBorder(nil, nil, nil, copyUrlBtn, targetURLEntry)),
+	)
+
+	box := container.NewVBox(
+		widget.NewLabelWithStyle("Bluetooth (BLE) Device Provisioner", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		widget.NewLabelWithStyle("Program your Seeed reTerminal E1001 with Wi-Fi and NeonServices URL wirelessly over Bluetooth.", fyne.TextAlignCenter, fyne.TextStyle{Italic: true}),
+		widget.NewSeparator(),
+		statusLabel,
+		form,
+		widget.NewSeparator(),
+		container.NewHBox(programBtn, webToolboxBtn),
+	)
+
+	showWideDialog("reTerminal Bluetooth Provisioning", "Close", "", box, 680, 440, m.window, func(bool) {})
+	refreshScan()
 }
