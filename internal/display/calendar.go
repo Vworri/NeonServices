@@ -43,11 +43,20 @@ func (c *CalendarClient) GetEvents(db *database.DB, deviceID string, calendarURL
 		}
 	}
 
-	// 2. Fetch iCal URL if provided
+	// 2. Fetch multiple iCal URLs if provided (supports multiple calendars separated by newlines, commas, or semicolons)
 	if calendarURL != "" {
-		icsEvents, err := c.fetchICS(calendarURL)
-		if err == nil {
-			allEvents = append(allEvents, icsEvents...)
+		rawURLs := strings.FieldsFunc(calendarURL, func(r rune) bool {
+			return r == '\n' || r == '\r' || r == ',' || r == ';'
+		})
+		for _, raw := range rawURLs {
+			u := strings.TrimSpace(raw)
+			if u == "" || !strings.HasPrefix(u, "http") {
+				continue
+			}
+			icsEvents, err := c.fetchICS(u)
+			if err == nil {
+				allEvents = append(allEvents, icsEvents...)
+			}
 		}
 	}
 

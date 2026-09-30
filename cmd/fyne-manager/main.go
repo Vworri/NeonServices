@@ -94,7 +94,7 @@ type ManagerApp struct {
 func main() {
 	a := app.NewWithID("com.neonservices.manager")
 	w := a.NewWindow("NeonServices Control Center")
-	w.Resize(fyne.NewSize(1080, 760))
+	w.Resize(fyne.NewSize(1100, 780))
 
 	m := &ManagerApp{
 		window:     w,
@@ -104,6 +104,17 @@ func main() {
 
 	w.SetContent(m.buildUI())
 	w.ShowAndRun()
+}
+
+// showWideDialog creates a responsive, appropriately sized custom modal
+func showWideDialog(title, confirmText, dismissText string, box fyne.CanvasObject, minW, minH float32, parent fyne.Window, onConfirm func(bool)) {
+	spacer := canvas.NewRectangle(color.Transparent)
+	spacer.SetMinSize(fyne.NewSize(minW, minH))
+	content := container.NewStack(spacer, container.NewPadded(box))
+
+	d := dialog.NewCustomConfirm(title, confirmText, dismissText, content, onConfirm, parent)
+	d.Show()
+	d.Resize(fyne.NewSize(minW+40, minH+90))
 }
 
 func (m *ManagerApp) buildUI() fyne.CanvasObject {
@@ -156,17 +167,25 @@ func (m *ManagerApp) showLoginDialog() {
 	userEntry.SetText("admin")
 	userEntry.SetPlaceHolder("admin or your username")
 	passEntry := widget.NewPasswordEntry()
-	passEntry.SetPlaceHolder("password")
+	passEntry.SetPlaceHolder("password (admin default: AdminPassword123!)")
 	urlEntry := widget.NewEntry()
 	urlEntry.SetText(m.apiBaseURL)
 
-	items := []*widget.FormItem{
+	form := widget.NewForm(
 		widget.NewFormItem("Server API URL", urlEntry),
 		widget.NewFormItem("Username", userEntry),
 		widget.NewFormItem("Password", passEntry),
-	}
+	)
 
-	dialog.ShowForm("Log In to NeonServices", "Login", "Cancel", items, func(confirmed bool) {
+	header := container.NewVBox(
+		widget.NewLabelWithStyle("Sign In to Your NeonServices Account", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		widget.NewLabelWithStyle("Default admin credentials: admin / AdminPassword123!", fyne.TextAlignCenter, fyne.TextStyle{Italic: true}),
+		widget.NewSeparator(),
+	)
+
+	box := container.NewVBox(header, form)
+
+	showWideDialog("Log In to NeonServices", "Login", "Cancel", box, 560, 260, m.window, func(confirmed bool) {
 		if !confirmed || userEntry.Text == "" || passEntry.Text == "" {
 			return
 		}
@@ -180,14 +199,18 @@ func (m *ManagerApp) showLoginDialog() {
 			bodyBytes, _ := json.Marshal(payload)
 			resp, err := m.httpClient.Post(m.apiBaseURL+"/api/v1/auth/login", "application/json", bytes.NewReader(bodyBytes))
 			if err != nil {
-				dialog.ShowError(fmt.Errorf("Failed to connect to %s: %v", m.apiBaseURL, err), m.window)
+				fyne.Do(func() {
+					dialog.ShowError(fmt.Errorf("Failed to connect to %s: %v", m.apiBaseURL, err), m.window)
+				})
 				return
 			}
 			defer resp.Body.Close()
 
 			if resp.StatusCode != http.StatusOK {
 				data, _ := io.ReadAll(resp.Body)
-				dialog.ShowError(fmt.Errorf("Login failed: %s", string(data)), m.window)
+				fyne.Do(func() {
+					dialog.ShowError(fmt.Errorf("Login failed: %s", string(data)), m.window)
+				})
 				return
 			}
 
@@ -199,82 +222,13 @@ func (m *ManagerApp) showLoginDialog() {
 				} `json:"data"`
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&authRes); err != nil || authRes.Data.User == nil {
-				dialog.ShowError(fmt.Errorf("Failed to parse server response"), m.window)
+				fyne.Do(func() {
+					dialog.ShowError(fmt.Errorf("Failed to parse server response"), m.window)
+				})
 				return
 			}
 
-			m.authToken = authRes.Data.Token
-			m.currentUser = authRes.Data.User
-
-			m.userStatusLabel.SetText(fmt.Sprintf("Logged in: %s (%s)", m.currentUser.Username, strings.ToUpper(string(m.currentUser.Role))))
-			m.loginBtn.Hide()
-			m.registerBtn.Hide()
-			m.logoutBtn.Show()
-
-			// Refresh all user tabs
-			m.refreshProfileView()
-			m.refreshDeviceList()
-			m.refreshUserFiles()
-			if m.currentUser.Role == database.RoleAdmin {
-				m.refreshUsersList()
-			}
-
-			dialog.ShowInformation("Welcome", fmt.Sprintf("Successfully logged in as %s (%s)", m.currentUser.Username, m.currentUser.Role), m.window)
-		}()
-	}, m.window)
-}
-
-func (m *ManagerApp) showRegisterDialog() {
-	userEntry := widget.NewEntry()
-	userEntry.SetPlaceHolder("username")
-	emailEntry := widget.NewEntry()
-	emailEntry.SetPlaceHolder("user@neonservices.local")
-	passEntry := widget.NewPasswordEntry()
-	passEntry.SetPlaceHolder("at least 8 characters")
-	urlEntry := widget.NewEntry()
-	urlEntry.SetText(m.apiBaseURL)
-
-	items := []*widget.FormItem{
-		widget.NewFormItem("Server API URL", urlEntry),
-		widget.NewFormItem("Username", userEntry),
-		widget.NewFormItem("Email", emailEntry),
-		widget.NewFormItem("Password", passEntry),
-	}
-
-	dialog.ShowForm("Register Account", "Register", "Cancel", items, func(confirmed bool) {
-		if !confirmed || userEntry.Text == "" || passEntry.Text == "" {
-			return
-		}
-		m.apiBaseURL = strings.TrimRight(urlEntry.Text, "/")
-
-		go func() {
-			payload := map[string]string{
-				"username": userEntry.Text,
-				"email":    emailEntry.Text,
-				"password": passEntry.Text,
-			}
-			bodyBytes, _ := json.Marshal(payload)
-			resp, err := m.httpClient.Post(m.apiBaseURL+"/api/v1/auth/register", "application/json", bytes.NewReader(bodyBytes))
-			if err != nil {
-				dialog.ShowError(fmt.Errorf("Failed to connect to %s: %v", m.apiBaseURL, err), m.window)
-				return
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusCreated {
-				data, _ := io.ReadAll(resp.Body)
-				dialog.ShowError(fmt.Errorf("Registration failed: %s", string(data)), m.window)
-				return
-			}
-
-			var authRes struct {
-				Success bool `json:"success"`
-				Data    struct {
-					Token string         `json:"token"`
-					User  *database.User `json:"user"`
-				} `json:"data"`
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&authRes); err == nil && authRes.Data.User != nil {
+			fyne.Do(func() {
 				m.authToken = authRes.Data.Token
 				m.currentUser = authRes.Data.User
 
@@ -289,10 +243,95 @@ func (m *ManagerApp) showRegisterDialog() {
 				if m.currentUser.Role == database.RoleAdmin {
 					m.refreshUsersList()
 				}
-				dialog.ShowInformation("Welcome", fmt.Sprintf("Account created successfully for %s!", m.currentUser.Username), m.window)
+
+				dialog.ShowInformation("Welcome", fmt.Sprintf("Successfully logged in as %s (%s)", m.currentUser.Username, m.currentUser.Role), m.window)
+			})
+		}()
+	})
+}
+
+func (m *ManagerApp) showRegisterDialog() {
+	userEntry := widget.NewEntry()
+	userEntry.SetPlaceHolder("new_username")
+	emailEntry := widget.NewEntry()
+	emailEntry.SetPlaceHolder("user@neonservices.local")
+	passEntry := widget.NewPasswordEntry()
+	passEntry.SetPlaceHolder("at least 8 characters")
+	urlEntry := widget.NewEntry()
+	urlEntry.SetText(m.apiBaseURL)
+
+	form := widget.NewForm(
+		widget.NewFormItem("Server API URL", urlEntry),
+		widget.NewFormItem("Username", userEntry),
+		widget.NewFormItem("Email", emailEntry),
+		widget.NewFormItem("Password", passEntry),
+	)
+
+	header := container.NewVBox(
+		widget.NewLabelWithStyle("Register New NeonServices Account", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		widget.NewSeparator(),
+	)
+
+	box := container.NewVBox(header, form)
+
+	showWideDialog("Register Account", "Register", "Cancel", box, 560, 290, m.window, func(confirmed bool) {
+		if !confirmed || userEntry.Text == "" || passEntry.Text == "" {
+			return
+		}
+		m.apiBaseURL = strings.TrimRight(urlEntry.Text, "/")
+
+		go func() {
+			payload := map[string]string{
+				"username": userEntry.Text,
+				"email":    emailEntry.Text,
+				"password": passEntry.Text,
+			}
+			bodyBytes, _ := json.Marshal(payload)
+			resp, err := m.httpClient.Post(m.apiBaseURL+"/api/v1/auth/register", "application/json", bytes.NewReader(bodyBytes))
+			if err != nil {
+				fyne.Do(func() {
+					dialog.ShowError(fmt.Errorf("Failed to connect to %s: %v", m.apiBaseURL, err), m.window)
+				})
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusCreated {
+				data, _ := io.ReadAll(resp.Body)
+				fyne.Do(func() {
+					dialog.ShowError(fmt.Errorf("Registration failed: %s", string(data)), m.window)
+				})
+				return
+			}
+
+			var authRes struct {
+				Success bool `json:"success"`
+				Data    struct {
+					Token string         `json:"token"`
+					User  *database.User `json:"user"`
+				} `json:"data"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&authRes); err == nil && authRes.Data.User != nil {
+				fyne.Do(func() {
+					m.authToken = authRes.Data.Token
+					m.currentUser = authRes.Data.User
+
+					m.userStatusLabel.SetText(fmt.Sprintf("Logged in: %s (%s)", m.currentUser.Username, strings.ToUpper(string(m.currentUser.Role))))
+					m.loginBtn.Hide()
+					m.registerBtn.Hide()
+					m.logoutBtn.Show()
+
+					m.refreshProfileView()
+					m.refreshDeviceList()
+					m.refreshUserFiles()
+					if m.currentUser.Role == database.RoleAdmin {
+						m.refreshUsersList()
+					}
+					dialog.ShowInformation("Welcome", fmt.Sprintf("Account created successfully for %s!", m.currentUser.Username), m.window)
+				})
 			}
 		}()
-	}, m.window)
+	})
 }
 
 func (m *ManagerApp) logout() {
@@ -342,7 +381,7 @@ func (m *ManagerApp) buildProfileTab() fyne.CanvasObject {
 		m.showChangePasswordDialog()
 	})
 
-	return container.NewVBox(
+	box := container.NewVBox(
 		widget.NewLabelWithStyle("User Profile & Authentication", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		m.profileInfoLabel,
 		widget.NewSeparator(),
@@ -351,6 +390,8 @@ func (m *ManagerApp) buildProfileTab() fyne.CanvasObject {
 		widget.NewSeparator(),
 		container.NewHBox(changePassBtn),
 	)
+
+	return container.NewScroll(container.NewPadded(box))
 }
 
 func (m *ManagerApp) refreshProfileView() {
@@ -384,7 +425,9 @@ func (m *ManagerApp) regenerateMyAPIKey() {
 			req.Header.Set("Authorization", "Bearer "+m.authToken)
 			resp, err := m.httpClient.Do(req)
 			if err != nil {
-				dialog.ShowError(err, m.window)
+				fyne.Do(func() {
+					dialog.ShowError(err, m.window)
+				})
 				return
 			}
 			defer resp.Body.Close()
@@ -395,9 +438,11 @@ func (m *ManagerApp) regenerateMyAPIKey() {
 				} `json:"data"`
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&res); err == nil && res.Data.APIKey != "" {
-				m.currentUser.APIKey = res.Data.APIKey
-				m.apiKeyEntry.SetText(res.Data.APIKey)
-				dialog.ShowInformation("Key Regenerated", "Your new API key has been created and updated!", m.window)
+				fyne.Do(func() {
+					m.currentUser.APIKey = res.Data.APIKey
+					m.apiKeyEntry.SetText(res.Data.APIKey)
+					dialog.ShowInformation("Key Regenerated", "Your new API key has been created and updated!", m.window)
+				})
 			}
 		}()
 	}, m.window)
@@ -412,13 +457,13 @@ func (m *ManagerApp) showChangePasswordDialog() {
 	newPassEntry := widget.NewPasswordEntry()
 	confirmPassEntry := widget.NewPasswordEntry()
 
-	items := []*widget.FormItem{
+	form := widget.NewForm(
 		widget.NewFormItem("Current Password", oldPassEntry),
 		widget.NewFormItem("New Password", newPassEntry),
 		widget.NewFormItem("Confirm Password", confirmPassEntry),
-	}
+	)
 
-	dialog.ShowForm("Change Password", "Update", "Cancel", items, func(confirmed bool) {
+	showWideDialog("Change Password", "Update", "Cancel", form, 540, 240, m.window, func(confirmed bool) {
 		if !confirmed {
 			return
 		}
@@ -441,22 +486,28 @@ func (m *ManagerApp) showChangePasswordDialog() {
 			req.Header.Set("Content-Type", "application/json")
 			resp, err := m.httpClient.Do(req)
 			if err != nil {
-				dialog.ShowError(err, m.window)
+				fyne.Do(func() {
+					dialog.ShowError(err, m.window)
+				})
 				return
 			}
 			defer resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				dialog.ShowInformation("Success", "Password updated successfully!", m.window)
+				fyne.Do(func() {
+					dialog.ShowInformation("Success", "Password updated successfully!", m.window)
+				})
 			} else {
 				data, _ := io.ReadAll(resp.Body)
-				dialog.ShowError(fmt.Errorf("Update failed: %s", string(data)), m.window)
+				fyne.Do(func() {
+					dialog.ShowError(fmt.Errorf("Update failed: %s", string(data)), m.window)
+				})
 			}
 		}()
-	}, m.window)
+	})
 }
 
 // ==============================================================================
-// My Devices (reTerminal E1001 / OpenDisplay)
+// My Devices (reTerminal E1001 / OpenDisplay) - Multiple Calendars Support
 // ==============================================================================
 
 func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
@@ -475,8 +526,10 @@ func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
 	m.displayTimezoneEntry = widget.NewEntry()
 	m.displayTimezoneEntry.SetText("America/New_York")
 
-	m.displayCalURLEntry = widget.NewEntry()
-	m.displayCalURLEntry.SetPlaceHolder("https://calendar.google.com/calendar/ical/.../basic.ics")
+	// Multi-calendar entry with multiple rows
+	m.displayCalURLEntry = widget.NewMultiLineEntry()
+	m.displayCalURLEntry.SetMinRowsVisible(4)
+	m.displayCalURLEntry.SetPlaceHolder("Multiple iCal (.ics) URLs (one per line, comma or semicolon separated):\nhttps://calendar.google.com/calendar/ical/.../basic.ics\nhttps://outlook.office365.com/.../reachcalendar.ics")
 
 	m.displayFullRefreshEntry = widget.NewEntry()
 	m.displayFullRefreshEntry.SetText("30")
@@ -523,13 +576,15 @@ func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
 		m.showAddEventDialog()
 	})
 
+	calendarHelpLabel := widget.NewLabelWithStyle("Tip: You can add multiple iCal calendars (personal, work, holidays). All feeds will be merged and chronologically sorted.", fyne.TextAlignLeading, fyne.TextStyle{Italic: true})
+
 	form := widget.NewForm(
 		widget.NewFormItem("Device Identifier", m.displayDeviceIDEntry),
 		widget.NewFormItem("City Name", m.displayCityEntry),
 		widget.NewFormItem("Latitude", m.displayLatEntry),
 		widget.NewFormItem("Longitude", m.displayLonEntry),
 		widget.NewFormItem("Timezone", m.displayTimezoneEntry),
-		widget.NewFormItem("iCal Calendar URL", m.displayCalURLEntry),
+		widget.NewFormItem("iCal Calendars (Multiple URLs)", m.displayCalURLEntry),
 		widget.NewFormItem("Full Refresh (minutes)", m.displayFullRefreshEntry),
 		widget.NewFormItem("Partial Refresh (minutes)", m.displayPartialRefreshEntry),
 	)
@@ -541,15 +596,18 @@ func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
 		deleteDeviceBtn,
 	)
 
-	return container.NewScroll(container.NewVBox(
+	content := container.NewVBox(
 		topSelectorRow,
 		widget.NewSeparator(),
+		calendarHelpLabel,
 		form,
 		container.NewHBox(saveBtn, previewBtn, addEventBtn),
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("Device Integration Helper:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		m.displayUrlLabel,
-	))
+	)
+
+	return container.NewScroll(container.NewPadded(content))
 }
 
 func (m *ManagerApp) refreshDeviceList() {
@@ -574,8 +632,10 @@ func (m *ManagerApp) refreshDeviceList() {
 				opts = append(opts, d.DeviceID)
 			}
 			opts = append(opts, "(New Device)")
-			m.deviceSelect.Options = opts
-			m.deviceSelect.Refresh()
+			fyne.Do(func() {
+				m.deviceSelect.Options = opts
+				m.deviceSelect.Refresh()
+			})
 		}
 	}()
 }
@@ -597,14 +657,16 @@ func (m *ManagerApp) fetchDisplayConfigFor(deviceID string) {
 			Data *database.DisplayConfig `json:"data"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&res); err == nil && res.Data != nil {
-			m.displayDeviceIDEntry.SetText(res.Data.DeviceID)
-			m.displayCityEntry.SetText(res.Data.CityName)
-			m.displayLatEntry.SetText(fmt.Sprintf("%.4f", res.Data.Latitude))
-			m.displayLonEntry.SetText(fmt.Sprintf("%.4f", res.Data.Longitude))
-			m.displayTimezoneEntry.SetText(res.Data.Timezone)
-			m.displayCalURLEntry.SetText(res.Data.CalendarURL)
-			m.displayFullRefreshEntry.SetText(fmt.Sprintf("%d", res.Data.FullRefreshMinutes))
-			m.displayPartialRefreshEntry.SetText(fmt.Sprintf("%d", res.Data.PartialRefreshMinutes))
+			fyne.Do(func() {
+				m.displayDeviceIDEntry.SetText(res.Data.DeviceID)
+				m.displayCityEntry.SetText(res.Data.CityName)
+				m.displayLatEntry.SetText(fmt.Sprintf("%.4f", res.Data.Latitude))
+				m.displayLonEntry.SetText(fmt.Sprintf("%.4f", res.Data.Longitude))
+				m.displayTimezoneEntry.SetText(res.Data.Timezone)
+				m.displayCalURLEntry.SetText(res.Data.CalendarURL)
+				m.displayFullRefreshEntry.SetText(fmt.Sprintf("%d", res.Data.FullRefreshMinutes))
+				m.displayPartialRefreshEntry.SetText(fmt.Sprintf("%d", res.Data.PartialRefreshMinutes))
+			})
 		}
 	}()
 }
@@ -637,17 +699,23 @@ func (m *ManagerApp) saveDisplayDevice() {
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := m.httpClient.Do(req)
 		if err != nil {
-			dialog.ShowError(err, m.window)
+			fyne.Do(func() {
+				dialog.ShowError(err, m.window)
+			})
 			return
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode == http.StatusOK {
-			dialog.ShowInformation("Device Saved", fmt.Sprintf("Device %q successfully registered to your account!", m.displayDeviceIDEntry.Text), m.window)
-			m.refreshDeviceList()
+			fyne.Do(func() {
+				dialog.ShowInformation("Device Saved", fmt.Sprintf("Device %q successfully registered to your account!", m.displayDeviceIDEntry.Text), m.window)
+				m.refreshDeviceList()
+			})
 		} else {
 			data, _ := io.ReadAll(resp.Body)
-			dialog.ShowError(fmt.Errorf("Failed to save device: %s", string(data)), m.window)
+			fyne.Do(func() {
+				dialog.ShowError(fmt.Errorf("Failed to save device: %s", string(data)), m.window)
+			})
 		}
 	}()
 }
@@ -670,12 +738,16 @@ func (m *ManagerApp) deleteCurrentDevice() {
 			req.Header.Set("Authorization", "Bearer "+m.authToken)
 			resp, err := m.httpClient.Do(req)
 			if err != nil {
-				dialog.ShowError(err, m.window)
+				fyne.Do(func() {
+					dialog.ShowError(err, m.window)
+				})
 				return
 			}
 			defer resp.Body.Close()
-			dialog.ShowInformation("Deleted", fmt.Sprintf("Device %q removed.", devID), m.window)
-			m.refreshDeviceList()
+			fyne.Do(func() {
+				dialog.ShowInformation("Deleted", fmt.Sprintf("Device %q removed.", devID), m.window)
+				m.refreshDeviceList()
+			})
 		}()
 	}, m.window)
 }
@@ -689,34 +761,44 @@ func (m *ManagerApp) previewDisplay() {
 		}
 		resp, err := m.httpClient.Do(req)
 		if err != nil {
-			dialog.ShowError(fmt.Errorf("Failed to render preview: %v", err), m.window)
+			fyne.Do(func() {
+				dialog.ShowError(fmt.Errorf("Failed to render preview: %v", err), m.window)
+			})
 			return
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			data, _ := io.ReadAll(resp.Body)
-			dialog.ShowError(fmt.Errorf("Render failed (%d): %s", resp.StatusCode, string(data)), m.window)
+			fyne.Do(func() {
+				dialog.ShowError(fmt.Errorf("Render failed (%d): %s", resp.StatusCode, string(data)), m.window)
+			})
 			return
 		}
 
 		img, _, err := image.Decode(resp.Body)
 		if err != nil {
-			dialog.ShowError(fmt.Errorf("Failed to decode PNG image: %v", err), m.window)
+			fyne.Do(func() {
+				dialog.ShowError(fmt.Errorf("Failed to decode PNG image: %v", err), m.window)
+			})
 			return
 		}
 
-		previewWin := fyne.CurrentApp().NewWindow(fmt.Sprintf("reTerminal Preview (800x480) - %s", m.displayDeviceIDEntry.Text))
-		canvasImg := canvas.NewImageFromImage(img)
-		canvasImg.FillMode = canvas.ImageFillContain
-		canvasImg.SetMinSize(fyne.NewSize(800, 480))
-
 		refreshType := resp.Header.Get("X-Refresh-Type")
-		infoLabel := widget.NewLabel(fmt.Sprintf("Resolution: 800x480 Monochrome | Refresh Mode: %s", strings.ToUpper(refreshType)))
+		deviceID := m.displayDeviceIDEntry.Text
 
-		previewWin.SetContent(container.NewBorder(nil, infoLabel, nil, nil, canvasImg))
-		previewWin.Resize(fyne.NewSize(820, 520))
-		previewWin.Show()
+		fyne.Do(func() {
+			previewWin := fyne.CurrentApp().NewWindow(fmt.Sprintf("reTerminal Preview (800x480) - %s", deviceID))
+			canvasImg := canvas.NewImageFromImage(img)
+			canvasImg.FillMode = canvas.ImageFillContain
+			canvasImg.SetMinSize(fyne.NewSize(800, 480))
+
+			infoLabel := widget.NewLabel(fmt.Sprintf("Resolution: 800x480 Monochrome | Refresh Mode: %s", strings.ToUpper(refreshType)))
+
+			previewWin.SetContent(container.NewBorder(nil, infoLabel, nil, nil, canvasImg))
+			previewWin.Resize(fyne.NewSize(820, 520))
+			previewWin.Show()
+		})
 	}()
 }
 
@@ -730,14 +812,14 @@ func (m *ManagerApp) showAddEventDialog() {
 	endEntry := widget.NewEntry()
 	endEntry.SetText(time.Now().Add(2 * time.Hour).Format("15:04"))
 
-	items := []*widget.FormItem{
+	form := widget.NewForm(
 		widget.NewFormItem("Event Title", titleEntry),
 		widget.NewFormItem("Location", locEntry),
 		widget.NewFormItem("Start Time (HH:MM)", startEntry),
 		widget.NewFormItem("End Time (HH:MM)", endEntry),
-	}
+	)
 
-	dialog.ShowForm("Add Calendar Event to reTerminal", "Add Event", "Cancel", items, func(confirmed bool) {
+	showWideDialog("Add Calendar Event to reTerminal", "Add Event", "Cancel", form, 540, 260, m.window, func(confirmed bool) {
 		if !confirmed || titleEntry.Text == "" {
 			return
 		}
@@ -764,13 +846,17 @@ func (m *ManagerApp) showAddEventDialog() {
 			req.Header.Set("Content-Type", "application/json")
 			resp, err := m.httpClient.Do(req)
 			if err != nil {
-				dialog.ShowError(err, m.window)
+				fyne.Do(func() {
+					dialog.ShowError(err, m.window)
+				})
 				return
 			}
 			defer resp.Body.Close()
-			dialog.ShowInformation("Event Added", "Event added! Next reTerminal refresh will display it.", m.window)
+			fyne.Do(func() {
+				dialog.ShowInformation("Event Added", "Event added! Next reTerminal refresh will display it.", m.window)
+			})
 		}()
-	}, m.window)
+	})
 }
 
 // ==============================================================================
@@ -797,7 +883,7 @@ func (m *ManagerApp) buildUserDataTab() fyne.CanvasObject {
 	)
 
 	return container.NewBorder(
-		container.NewVBox(header, widget.NewSeparator()),
+		container.NewVBox(container.NewPadded(header), widget.NewSeparator()),
 		nil, nil, nil,
 		container.NewScroll(m.filesListContainer),
 	)
@@ -805,9 +891,11 @@ func (m *ManagerApp) buildUserDataTab() fyne.CanvasObject {
 
 func (m *ManagerApp) refreshUserFiles() {
 	if m.authToken == "" {
-		m.storageUsageLabel.SetText("Storage: Not logged in")
-		m.filesListContainer.Objects = nil
-		m.filesListContainer.Refresh()
+		fyne.Do(func() {
+			m.storageUsageLabel.SetText("Storage: Not logged in")
+			m.filesListContainer.Objects = nil
+			m.filesListContainer.Refresh()
+		})
 		return
 	}
 
@@ -824,10 +912,12 @@ func (m *ManagerApp) refreshUserFiles() {
 				} `json:"data"`
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&qRes); err == nil {
-				m.storageUsageLabel.SetText(fmt.Sprintf("Storage: %.2f MB / %.2f GB (%.1f%% used)",
-					float64(qRes.Data.UsedBytes)/(1024*1024),
-					float64(qRes.Data.QuotaBytes)/(1024*1024*1024),
-					qRes.Data.Percentage))
+				fyne.Do(func() {
+					m.storageUsageLabel.SetText(fmt.Sprintf("Storage: %.2f MB / %.2f GB (%.1f%% used)",
+						float64(qRes.Data.UsedBytes)/(1024*1024),
+						float64(qRes.Data.QuotaBytes)/(1024*1024*1024),
+						qRes.Data.Percentage))
+				})
 			}
 			resp.Body.Close()
 		}
@@ -877,8 +967,10 @@ func (m *ManagerApp) refreshUserFiles() {
 			}
 		}
 
-		m.filesListContainer.Objects = items
-		m.filesListContainer.Refresh()
+		fyne.Do(func() {
+			m.filesListContainer.Objects = items
+			m.filesListContainer.Refresh()
+		})
 	}()
 }
 
@@ -896,7 +988,9 @@ func (m *ManagerApp) uploadFileToCloud() {
 
 		data, err := io.ReadAll(reader)
 		if err != nil {
-			dialog.ShowError(err, m.window)
+			fyne.Do(func() {
+				dialog.ShowError(err, m.window)
+			})
 			return
 		}
 
@@ -907,7 +1001,9 @@ func (m *ManagerApp) uploadFileToCloud() {
 			w := multipart.NewWriter(&b)
 			part, err := w.CreateFormFile("file", fileName)
 			if err != nil {
-				dialog.ShowError(err, m.window)
+				fyne.Do(func() {
+					dialog.ShowError(err, m.window)
+				})
 				return
 			}
 			_, _ = part.Write(data)
@@ -919,17 +1015,23 @@ func (m *ManagerApp) uploadFileToCloud() {
 
 			resp, err := m.httpClient.Do(req)
 			if err != nil {
-				dialog.ShowError(err, m.window)
+				fyne.Do(func() {
+					dialog.ShowError(err, m.window)
+				})
 				return
 			}
 			defer resp.Body.Close()
 
 			if resp.StatusCode == http.StatusCreated {
-				dialog.ShowInformation("Uploaded", fmt.Sprintf("Successfully uploaded %s to NAS!", fileName), m.window)
-				m.refreshUserFiles()
+				fyne.Do(func() {
+					dialog.ShowInformation("Uploaded", fmt.Sprintf("Successfully uploaded %s to NAS!", fileName), m.window)
+					m.refreshUserFiles()
+				})
 			} else {
 				resBody, _ := io.ReadAll(resp.Body)
-				dialog.ShowError(fmt.Errorf("Upload failed: %s", string(resBody)), m.window)
+				fyne.Do(func() {
+					dialog.ShowError(fmt.Errorf("Upload failed: %s", string(resBody)), m.window)
+				})
 			}
 		}()
 	}, m.window)
@@ -948,18 +1050,24 @@ func (m *ManagerApp) downloadCloudFile(fileName string) {
 			req.Header.Set("Authorization", "Bearer "+m.authToken)
 			resp, err := m.httpClient.Do(req)
 			if err != nil {
-				dialog.ShowError(err, m.window)
+				fyne.Do(func() {
+					dialog.ShowError(err, m.window)
+				})
 				return
 			}
 			defer resp.Body.Close()
 
 			if resp.StatusCode != http.StatusOK {
-				dialog.ShowError(fmt.Errorf("Download failed with status %d", resp.StatusCode), m.window)
+				fyne.Do(func() {
+					dialog.ShowError(fmt.Errorf("Download failed with status %d", resp.StatusCode), m.window)
+				})
 				return
 			}
 
 			_, _ = io.Copy(writer, resp.Body)
-			dialog.ShowInformation("Downloaded", fmt.Sprintf("File %s downloaded successfully!", fileName), m.window)
+			fyne.Do(func() {
+				dialog.ShowInformation("Downloaded", fmt.Sprintf("File %s downloaded successfully!", fileName), m.window)
+			})
 		}()
 	}, m.window)
 }
@@ -975,12 +1083,16 @@ func (m *ManagerApp) deleteCloudFile(fileName string) {
 			req.Header.Set("Authorization", "Bearer "+m.authToken)
 			resp, err := m.httpClient.Do(req)
 			if err != nil {
-				dialog.ShowError(err, m.window)
+				fyne.Do(func() {
+					dialog.ShowError(err, m.window)
+				})
 				return
 			}
 			defer resp.Body.Close()
-			dialog.ShowInformation("Deleted", fmt.Sprintf("File %s deleted.", fileName), m.window)
-			m.refreshUserFiles()
+			fyne.Do(func() {
+				dialog.ShowInformation("Deleted", fmt.Sprintf("File %s deleted.", fileName), m.window)
+				m.refreshUserFiles()
+			})
 		}()
 	}, m.window)
 }
@@ -1008,7 +1120,7 @@ func (m *ManagerApp) buildUsersTab() fyne.CanvasObject {
 	)
 
 	return container.NewBorder(
-		container.NewVBox(header, widget.NewSeparator()),
+		container.NewVBox(container.NewPadded(header), widget.NewSeparator()),
 		nil, nil, nil,
 		container.NewScroll(m.usersTableContainer),
 	)
@@ -1016,8 +1128,10 @@ func (m *ManagerApp) buildUsersTab() fyne.CanvasObject {
 
 func (m *ManagerApp) refreshUsersList() {
 	if m.authToken == "" {
-		m.usersTableContainer.Objects = []fyne.CanvasObject{widget.NewLabel("Please log in as an administrator to view and manage users.")}
-		m.usersTableContainer.Refresh()
+		fyne.Do(func() {
+			m.usersTableContainer.Objects = []fyne.CanvasObject{widget.NewLabel("Please log in as an administrator to view and manage users.")}
+			m.usersTableContainer.Refresh()
+		})
 		return
 	}
 
@@ -1026,14 +1140,18 @@ func (m *ManagerApp) refreshUsersList() {
 		req.Header.Set("Authorization", "Bearer "+m.authToken)
 		resp, err := m.httpClient.Do(req)
 		if err != nil {
-			dialog.ShowError(err, m.window)
+			fyne.Do(func() {
+				dialog.ShowError(err, m.window)
+			})
 			return
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			m.usersTableContainer.Objects = []fyne.CanvasObject{widget.NewLabel("Access Denied: Current user does not have Administrator privileges.")}
-			m.usersTableContainer.Refresh()
+			fyne.Do(func() {
+				m.usersTableContainer.Objects = []fyne.CanvasObject{widget.NewLabel("Access Denied: Current user does not have Administrator privileges.")}
+				m.usersTableContainer.Refresh()
+			})
 			return
 		}
 
@@ -1076,8 +1194,10 @@ func (m *ManagerApp) refreshUsersList() {
 			rows = append(rows, userCard)
 		}
 
-		m.usersTableContainer.Objects = rows
-		m.usersTableContainer.Refresh()
+		fyne.Do(func() {
+			m.usersTableContainer.Objects = rows
+			m.usersTableContainer.Refresh()
+		})
 	}()
 }
 
@@ -1097,16 +1217,16 @@ func (m *ManagerApp) showCreateUserDialog() {
 	quotaEntry := widget.NewEntry()
 	quotaEntry.SetText("50")
 
-	items := []*widget.FormItem{
+	form := widget.NewForm(
 		widget.NewFormItem("Username", userEntry),
 		widget.NewFormItem("Email", emailEntry),
 		widget.NewFormItem("Password", passEntry),
 		widget.NewFormItem("Custom API Key", apiKeyEntry),
 		widget.NewFormItem("Role", roleSelect),
 		widget.NewFormItem("Quota (GB)", quotaEntry),
-	}
+	)
 
-	dialog.ShowForm("Admin: Create New User", "Create User", "Cancel", items, func(confirmed bool) {
+	showWideDialog("Admin: Create New User", "Create User", "Cancel", form, 600, 360, m.window, func(confirmed bool) {
 		if !confirmed || userEntry.Text == "" || passEntry.Text == "" {
 			return
 		}
@@ -1129,19 +1249,25 @@ func (m *ManagerApp) showCreateUserDialog() {
 			req.Header.Set("Content-Type", "application/json")
 			resp, err := m.httpClient.Do(req)
 			if err != nil {
-				dialog.ShowError(err, m.window)
+				fyne.Do(func() {
+					dialog.ShowError(err, m.window)
+				})
 				return
 			}
 			defer resp.Body.Close()
 			if resp.StatusCode == http.StatusCreated {
-				dialog.ShowInformation("User Created", fmt.Sprintf("User %q created successfully!", userEntry.Text), m.window)
-				m.refreshUsersList()
+				fyne.Do(func() {
+					dialog.ShowInformation("User Created", fmt.Sprintf("User %q created successfully!", userEntry.Text), m.window)
+					m.refreshUsersList()
+				})
 			} else {
 				data, _ := io.ReadAll(resp.Body)
-				dialog.ShowError(fmt.Errorf("Failed: %s", string(data)), m.window)
+				fyne.Do(func() {
+					dialog.ShowError(fmt.Errorf("Failed: %s", string(data)), m.window)
+				})
 			}
 		}()
-	}, m.window)
+	})
 }
 
 func (m *ManagerApp) showEditUserDialog(u *database.User) {
@@ -1158,16 +1284,16 @@ func (m *ManagerApp) showEditUserDialog(u *database.User) {
 	quotaEntry := widget.NewEntry()
 	quotaEntry.SetText(fmt.Sprintf("%d", u.QuotaBytes/(1024*1024*1024)))
 
-	items := []*widget.FormItem{
+	form := widget.NewForm(
 		widget.NewFormItem("Username", usernameEntry),
 		widget.NewFormItem("Email", emailEntry),
 		widget.NewFormItem("New Password", passEntry),
 		widget.NewFormItem("API Key", apiKeyEntry),
 		widget.NewFormItem("Role", roleSelect),
 		widget.NewFormItem("Quota (GB)", quotaEntry),
-	}
+	)
 
-	dialog.ShowForm("Admin: Edit User "+u.Username, "Save Changes", "Cancel", items, func(confirmed bool) {
+	showWideDialog("Admin: Edit User "+u.Username, "Save Changes", "Cancel", form, 600, 360, m.window, func(confirmed bool) {
 		if !confirmed {
 			return
 		}
@@ -1190,19 +1316,25 @@ func (m *ManagerApp) showEditUserDialog(u *database.User) {
 			req.Header.Set("Content-Type", "application/json")
 			resp, err := m.httpClient.Do(req)
 			if err != nil {
-				dialog.ShowError(err, m.window)
+				fyne.Do(func() {
+					dialog.ShowError(err, m.window)
+				})
 				return
 			}
 			defer resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				dialog.ShowInformation("Updated", "User details updated!", m.window)
-				m.refreshUsersList()
+				fyne.Do(func() {
+					dialog.ShowInformation("Updated", "User details updated!", m.window)
+					m.refreshUsersList()
+				})
 			} else {
 				data, _ := io.ReadAll(resp.Body)
-				dialog.ShowError(fmt.Errorf("Update failed: %s", string(data)), m.window)
+				fyne.Do(func() {
+					dialog.ShowError(fmt.Errorf("Update failed: %s", string(data)), m.window)
+				})
 			}
 		}()
-	}, m.window)
+	})
 }
 
 func (m *ManagerApp) confirmDeleteUser(u *database.User) {
@@ -1215,12 +1347,16 @@ func (m *ManagerApp) confirmDeleteUser(u *database.User) {
 			req.Header.Set("Authorization", "Bearer "+m.authToken)
 			resp, err := m.httpClient.Do(req)
 			if err != nil {
-				dialog.ShowError(err, m.window)
+				fyne.Do(func() {
+					dialog.ShowError(err, m.window)
+				})
 				return
 			}
 			defer resp.Body.Close()
-			dialog.ShowInformation("Deleted", fmt.Sprintf("User %s has been deleted.", u.Username), m.window)
-			m.refreshUsersList()
+			fyne.Do(func() {
+				dialog.ShowInformation("Deleted", fmt.Sprintf("User %s has been deleted.", u.Username), m.window)
+				m.refreshUsersList()
+			})
 		}()
 	}, m.window)
 }
@@ -1231,7 +1367,9 @@ func (m *ManagerApp) adminRegenKey(userID int64) {
 		req.Header.Set("Authorization", "Bearer "+m.authToken)
 		resp, err := m.httpClient.Do(req)
 		if err != nil {
-			dialog.ShowError(err, m.window)
+			fyne.Do(func() {
+				dialog.ShowError(err, m.window)
+			})
 			return
 		}
 		defer resp.Body.Close()
@@ -1242,8 +1380,10 @@ func (m *ManagerApp) adminRegenKey(userID int64) {
 			} `json:"data"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&res); err == nil {
-			dialog.ShowInformation("New API Key", fmt.Sprintf("Key regenerated:\n%s", res.Data.APIKey), m.window)
-			m.refreshUsersList()
+			fyne.Do(func() {
+				dialog.ShowInformation("New API Key", fmt.Sprintf("Key regenerated:\n%s", res.Data.APIKey), m.window)
+				m.refreshUsersList()
+			})
 		}
 	}()
 }
@@ -1283,7 +1423,7 @@ func (m *ManagerApp) buildSettingsTab() fyne.CanvasObject {
 		widget.NewFormItem("Public Registration", m.allowRegCheck),
 	)
 
-	return container.NewScroll(container.NewVBox(
+	content := container.NewVBox(
 		widget.NewLabelWithStyle("System-Wide Server Configuration", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		container.NewHBox(fetchBtn, saveBtn),
 		widget.NewSeparator(),
@@ -1291,7 +1431,9 @@ func (m *ManagerApp) buildSettingsTab() fyne.CanvasObject {
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("System Health & NAS Hardware Status:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		m.healthStatusLabel,
-	))
+	)
+
+	return container.NewScroll(container.NewPadded(content))
 }
 
 func (m *ManagerApp) fetchAdminSettings() {
@@ -1305,7 +1447,9 @@ func (m *ManagerApp) fetchAdminSettings() {
 		req.Header.Set("Authorization", "Bearer "+m.authToken)
 		resp, err := m.httpClient.Do(req)
 		if err != nil {
-			dialog.ShowError(err, m.window)
+			fyne.Do(func() {
+				dialog.ShowError(err, m.window)
+			})
 			return
 		}
 		defer resp.Body.Close()
@@ -1314,11 +1458,13 @@ func (m *ManagerApp) fetchAdminSettings() {
 			Data config.Config `json:"data"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&res); err == nil {
-			m.mountPathEntry.SetText(res.Data.Storage.BaseMountPath)
-			m.settingsPortEntry.SetText(fmt.Sprintf("%d", res.Data.Server.Port))
-			m.quotaEntry.SetText(fmt.Sprintf("%d", res.Data.Storage.DefaultQuotaBytes/(1024*1024*1024)))
-			m.uploadEntry.SetText(fmt.Sprintf("%d", res.Data.Storage.MaxUploadSizeMB))
-			m.allowRegCheck.SetChecked(res.Data.Auth.AllowRegistration)
+			fyne.Do(func() {
+				m.mountPathEntry.SetText(res.Data.Storage.BaseMountPath)
+				m.settingsPortEntry.SetText(fmt.Sprintf("%d", res.Data.Server.Port))
+				m.quotaEntry.SetText(fmt.Sprintf("%d", res.Data.Storage.DefaultQuotaBytes/(1024*1024*1024)))
+				m.uploadEntry.SetText(fmt.Sprintf("%d", res.Data.Storage.MaxUploadSizeMB))
+				m.allowRegCheck.SetChecked(res.Data.Auth.AllowRegistration)
+			})
 		}
 
 		// Fetch health
@@ -1338,13 +1484,17 @@ func (m *ManagerApp) fetchAdminSettings() {
 				} `json:"data"`
 			}
 			if err := json.NewDecoder(respH.Body).Decode(&hRes); err == nil {
-				m.healthStatusLabel.SetText(fmt.Sprintf("Status: %s | Uptime: %s | Goroutines: %d | Mem Alloc: %d MB (Sys: %d MB) | Runtime: %s",
-					strings.ToUpper(hRes.Data.Status), hRes.Data.Uptime, hRes.Data.NumGoroutine, hRes.Data.Memory.AllocMB, hRes.Data.Memory.SysMB, hRes.Data.GoVersion))
+				fyne.Do(func() {
+					m.healthStatusLabel.SetText(fmt.Sprintf("Status: %s | Uptime: %s | Goroutines: %d | Mem Alloc: %d MB (Sys: %d MB) | Runtime: %s",
+						strings.ToUpper(hRes.Data.Status), hRes.Data.Uptime, hRes.Data.NumGoroutine, hRes.Data.Memory.AllocMB, hRes.Data.Memory.SysMB, hRes.Data.GoVersion))
+				})
 			}
 			respH.Body.Close()
 		}
 
-		dialog.ShowInformation("Fetched", "Settings and system health retrieved successfully!", m.window)
+		fyne.Do(func() {
+			dialog.ShowInformation("Fetched", "Settings and system health retrieved successfully!", m.window)
+		})
 	}()
 }
 
@@ -1372,15 +1522,21 @@ func (m *ManagerApp) saveAdminSettings() {
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := m.httpClient.Do(req)
 		if err != nil {
-			dialog.ShowError(err, m.window)
+			fyne.Do(func() {
+				dialog.ShowError(err, m.window)
+			})
 			return
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode == http.StatusOK {
-			dialog.ShowInformation("Saved", "System-wide settings updated successfully!", m.window)
+			fyne.Do(func() {
+				dialog.ShowInformation("Saved", "System-wide settings updated successfully!", m.window)
+			})
 		} else {
 			data, _ := io.ReadAll(resp.Body)
-			dialog.ShowError(fmt.Errorf("Update failed: %s", string(data)), m.window)
+			fyne.Do(func() {
+				dialog.ShowError(fmt.Errorf("Update failed: %s", string(data)), m.window)
+			})
 		}
 	}()
 }
@@ -1436,7 +1592,7 @@ func (m *ManagerApp) buildServiceTab() fyne.CanvasObject {
 		m.logsEntry,
 	)
 
-	return container.NewScroll(connBox)
+	return container.NewScroll(container.NewPadded(connBox))
 }
 
 func (m *ManagerApp) connectSSH() {
@@ -1455,13 +1611,17 @@ func (m *ManagerApp) connectSSH() {
 			Timeout:  10 * time.Second,
 		})
 		if err := client.Connect(); err != nil {
-			m.connLabel.SetText(fmt.Sprintf("SSH Error: %v", err))
-			dialog.ShowError(err, m.window)
+			fyne.Do(func() {
+				m.connLabel.SetText(fmt.Sprintf("SSH Error: %v", err))
+				dialog.ShowError(err, m.window)
+			})
 			return
 		}
 		m.sshClient = client
-		m.connLabel.SetText(fmt.Sprintf("SSH Connected to %s@%s:%d", m.userEntry.Text, m.hostEntry.Text, port))
-		m.refreshStatus()
+		fyne.Do(func() {
+			m.connLabel.SetText(fmt.Sprintf("SSH Connected to %s@%s:%d", m.userEntry.Text, m.hostEntry.Text, port))
+			m.refreshStatus()
+		})
 	}()
 }
 
@@ -1473,7 +1633,9 @@ func (m *ManagerApp) runServiceCmd(cmd string) {
 	go func() {
 		_, err := m.sshClient.Run(cmd)
 		if err != nil {
-			dialog.ShowError(err, m.window)
+			fyne.Do(func() {
+				dialog.ShowError(err, m.window)
+			})
 		}
 		time.Sleep(500 * time.Millisecond)
 		m.refreshStatus()
@@ -1487,12 +1649,14 @@ func (m *ManagerApp) refreshStatus() {
 	go func() {
 		statusOut, _ := m.sshClient.Run("systemctl is-active neonservices || true")
 		status := strings.TrimSpace(statusOut)
-		m.serviceStatusLabel.SetText(fmt.Sprintf("neonservices.service: %s", strings.ToUpper(status)))
-
 		logs, err := m.sshClient.Run("journalctl -u neonservices -n 35 --no-pager 2>&1 || true")
-		if err == nil {
-			m.logsEntry.SetText(logs)
-		}
+
+		fyne.Do(func() {
+			m.serviceStatusLabel.SetText(fmt.Sprintf("neonservices.service: %s", strings.ToUpper(status)))
+			if err == nil {
+				m.logsEntry.SetText(logs)
+			}
+		})
 	}()
 }
 
@@ -1512,18 +1676,22 @@ func (m *ManagerApp) buildNASTab() fyne.CanvasObject {
 		go func() {
 			cmd := "df -h /mnt/pocketcloud && ls -la /mnt/pocketcloud 2>&1 || true"
 			out, err := m.sshClient.Run(cmd)
-			if err != nil {
-				m.nasStatusText.SetText(fmt.Sprintf("Failed or unmounted:\n%s\n%v", out, err))
-			} else {
-				m.nasStatusText.SetText(fmt.Sprintf("StationPC PocketCloud NAS Storage Status:\n\n%s", out))
-			}
+			fyne.Do(func() {
+				if err != nil {
+					m.nasStatusText.SetText(fmt.Sprintf("Failed or unmounted:\n%s\n%v", out, err))
+				} else {
+					m.nasStatusText.SetText(fmt.Sprintf("StationPC PocketCloud NAS Storage Status:\n\n%s", out))
+				}
+			})
 		}()
 	})
 
-	return container.NewVBox(
+	content := container.NewVBox(
 		widget.NewLabelWithStyle("StationPC PocketCloud NAS Host Mount (/mnt/pocketcloud):", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		inspectBtn,
 		widget.NewSeparator(),
 		m.nasStatusText,
 	)
+
+	return container.NewScroll(container.NewPadded(content))
 }
