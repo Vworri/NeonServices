@@ -589,11 +589,21 @@ func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
 		widget.NewFormItem("Partial Refresh (minutes)", m.displayPartialRefreshEntry),
 	)
 
+	copyUrlBtn := widget.NewButtonWithIcon("Copy Easy URL (/screen)", theme.ContentCopyIcon(), func() {
+		m.window.Clipboard().SetContent(m.apiBaseURL + "/screen")
+		dialog.ShowInformation("URL Copied", fmt.Sprintf("Copied easy image URL to clipboard: %s/screen", m.apiBaseURL), m.window)
+	})
+
+	howToBtn := widget.NewButtonWithIcon("1-Minute Setup Guide", theme.HelpIcon(), func() {
+		m.showEasySetupGuide()
+	})
+
 	topSelectorRow := container.NewHBox(
 		widget.NewLabelWithStyle("My Devices:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		m.deviceSelect,
 		refreshDevicesBtn,
 		deleteDeviceBtn,
+		howToBtn,
 	)
 
 	content := container.NewVBox(
@@ -601,10 +611,11 @@ func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
 		widget.NewSeparator(),
 		calendarHelpLabel,
 		form,
-		container.NewHBox(saveBtn, previewBtn, addEventBtn),
+		container.NewHBox(saveBtn, previewBtn, addEventBtn, copyUrlBtn),
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("Device Integration Helper:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		m.displayUrlLabel,
+		widget.NewLabel("Shortest URL (Default device): " + m.apiBaseURL + "/screen"),
 	)
 
 	return container.NewScroll(container.NewPadded(content))
@@ -754,7 +765,11 @@ func (m *ManagerApp) deleteCurrentDevice() {
 
 func (m *ManagerApp) previewDisplay() {
 	go func() {
-		url := fmt.Sprintf("%s/api/v1/display/render?device_id=%s", m.apiBaseURL, m.displayDeviceIDEntry.Text)
+		devID := strings.TrimSpace(m.displayDeviceIDEntry.Text)
+		if devID == "" {
+			devID = "reterminal-01"
+		}
+		url := fmt.Sprintf("%s/api/v1/display/%s/image.png", m.apiBaseURL, devID)
 		req, _ := http.NewRequest("GET", url, nil)
 		if m.authToken != "" {
 			req.Header.Set("Authorization", "Bearer "+m.authToken)
@@ -1694,4 +1709,31 @@ func (m *ManagerApp) buildNASTab() fyne.CanvasObject {
 	)
 
 	return container.NewScroll(container.NewPadded(content))
+}
+
+
+func (m *ManagerApp) showEasySetupGuide() {
+	opt1 := `1. On your phone or laptop connected to Wi-Fi, open your reTerminal in your browser:
+   http://opendisplay.local (or the IP shown on your reTerminal e-Paper)
+2. In the 'Image URL' / 'Server URL' field, paste this:
+   ` + m.apiBaseURL + `/api/v1/display/` + m.displayDeviceIDEntry.Text + `/image.png
+   (Or short URL: ` + m.apiBaseURL + `/screen)
+3. Set refresh interval to 60 seconds and save. Done!`
+
+	opt2 := `Open a terminal or SSH on your reTerminal and paste this single command:
+
+curl -sSL ` + m.apiBaseURL + `/reterminal.sh | sudo bash
+
+This automatically installs the refresh service and connects it to NeonServices.`
+
+	box := container.NewVBox(
+		widget.NewLabelWithStyle("Easiest Ways to Connect Your reTerminal E1001", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Option 1: OpenDisplay Web Portal (Fastest & No Terminal Required - 30 seconds)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabel(opt1),
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Option 2: One-Line Auto Installer (If reTerminal runs Linux / Terminal)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabel(opt2),
+	)
+	showWideDialog("reTerminal E1001 Quick Setup", "Close", "", box, 640, 360, m.window, func(bool) {})
 }

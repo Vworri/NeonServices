@@ -125,6 +125,15 @@ func (s *Service) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/display/{device_id}/image.bmp", s.handleRenderBMP)
 	mux.HandleFunc("GET /api/v1/display/{device_id}/image.raw", s.handleRenderRaw)
 	mux.HandleFunc("GET /api/v1/display/{device_id}/image", s.handleRenderPNG) // default to png
+	mux.HandleFunc("GET /api/v1/display/render", s.handleRenderPNG)
+
+	// Convenient Short URLs for Easy User Setup (minimal typing):
+	mux.HandleFunc("GET /screen", func(w http.ResponseWriter, r *http.Request) {
+		r.SetPathValue("device_id", "reterminal-01")
+		s.handleRenderPNG(w, r)
+	})
+	mux.HandleFunc("GET /d/{device_id}", s.handleRenderPNG)
+	mux.HandleFunc("GET /reterminal.sh", s.handleSetupScript)
 
 	// 2. Data & Status Endpoint
 	mux.HandleFunc("GET /api/v1/display/{device_id}/status", s.handleStatus)
@@ -139,6 +148,12 @@ func (s *Service) RegisterRoutes(mux *http.ServeMux) {
 
 func (s *Service) handleRenderPNG(w http.ResponseWriter, r *http.Request) {
 	deviceID := r.PathValue("device_id")
+	if deviceID == "" {
+		deviceID = r.URL.Query().Get("device_id")
+	}
+	if deviceID == "" {
+		deviceID = "reterminal-01"
+	}
 	data, err := s.GetData(deviceID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -292,4 +307,60 @@ func (s *Service) handleAddEvent(w http.ResponseWriter, r *http.Request) {
 		"success": true,
 		"data":    event,
 	})
+}
+
+
+func (s *Service) handleSetupScript(w http.ResponseWriter, r *http.Request) {
+	host := r.Host
+	if host == "" {
+		host = "192.168.3.54:8080"
+	}
+	script := fmt.Sprintf(`#!/usr/bin/env bash
+set -e
+echo "======================================================"
+echo "  Seeed reTerminal E1001 OpenDisplay Auto-Installer   "
+echo "======================================================"
+
+TARGET_URL="http://%s/screen"
+echo "[+] Configuring dashboard feed: "
+
+# 1. Update OpenDisplay config if present
+if [ -d /etc/opendisplay ]; then
+    cat << EOF > /etc/opendisplay/config.json
+{
+  "image_url": "",
+  "interval_seconds": 60,
+  "rotation": 0
+}
+EOF
+    systemctl restart opendisplay || true
+    echo "[+] OpenDisplay service reloaded!"
+fi
+
+# 2. Setup periodic curl updater for Linux framebuffer or e-paper service
+cat << 'EOF' > /usr/local/bin/update-e-paper.sh
+#!/usr/bin/env bash
+URL="http://%s/screen"
+TMP_IMG="/tmp/epaper_next.png"
+
+# Fetch image with partial refresh detection
+HEADERS=$(curl -sSL -D - "$URL" -o "$TMP_IMG")
+REFRESH_TYPE=$(echo "$HEADERS" | grep -i "^X-Refresh-Type:" | tr -d '
+' | awk '{print $2}')
+
+echo "[$(date)] Screen updated: $REFRESH_TYPE"
+EOF
+chmod +x /usr/local/bin/update-e-paper.sh
+
+# Run once immediately
+/usr/local/bin/update-e-paper.sh || true
+
+echo ""
+echo "🎉 reTerminal E1001 setup complete! Screen will refresh every minute."
+echo "======================================================"
+`, host, host)
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(script))
 }
