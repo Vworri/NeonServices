@@ -114,7 +114,7 @@ func main() {
 	}
 
 	if m.tryRestoreSession() {
-		m.showMainAppUI()
+		w.SetContent(m.buildMainAppUI())
 		m.refreshProfileView()
 		m.refreshDeviceList()
 		m.refreshUserFiles()
@@ -122,7 +122,7 @@ func main() {
 			m.refreshUsersList()
 		}
 	} else {
-		m.showSplashScreen()
+		w.SetContent(m.buildSplashScreen())
 	}
 
 	w.ShowAndRun()
@@ -356,16 +356,17 @@ func (m *ManagerApp) onLoginSuccess(token string, user *database.User) {
 	m.currentUser = user
 
 	m.saveSession(token, user, m.apiBaseURL)
-	m.showMainAppUI()
 
-	m.refreshProfileView()
-	m.refreshDeviceList()
-	m.refreshUserFiles()
-	if m.currentUser.Role == database.RoleAdmin {
-		m.refreshUsersList()
-	}
-
-	dialog.ShowInformation("Welcome", fmt.Sprintf("Successfully logged in as %s (%s)", m.currentUser.Username, m.currentUser.Role), m.window)
+	fyne.Do(func() {
+		m.window.SetContent(m.buildMainAppUI())
+		m.refreshProfileView()
+		m.refreshDeviceList()
+		m.refreshUserFiles()
+		if m.currentUser != nil && m.currentUser.Role == database.RoleAdmin {
+			m.refreshUsersList()
+		}
+		dialog.ShowInformation("Welcome", fmt.Sprintf("Successfully logged in as %s (%s)", m.currentUser.Username, m.currentUser.Role), m.window)
+	})
 }
 
 func (m *ManagerApp) quickAdminLogin() {
@@ -649,7 +650,7 @@ func (m *ManagerApp) buildProfileTab() fyne.CanvasObject {
 }
 
 func (m *ManagerApp) refreshProfileView() {
-	if m.currentUser == nil {
+	if m.currentUser == nil || m.profileInfoLabel == nil || m.apiKeyEntry == nil {
 		return
 	}
 	quotaMB := float64(m.currentUser.QuotaBytes) / (1024 * 1024)
@@ -923,7 +924,7 @@ func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
 }
 
 func (m *ManagerApp) refreshDeviceList() {
-	if m.authToken == "" {
+	if m.authToken == "" || m.deviceSelect == nil {
 		return
 	}
 	go func() {
@@ -1226,10 +1227,17 @@ func (m *ManagerApp) buildUserDataTab() fyne.CanvasObject {
 func (m *ManagerApp) refreshUserFiles() {
 	if m.authToken == "" {
 		fyne.Do(func() {
-			m.storageUsageLabel.SetText("Storage: Not logged in")
-			m.filesListContainer.Objects = nil
-			m.filesListContainer.Refresh()
+			if m.storageUsageLabel != nil {
+				m.storageUsageLabel.SetText("Storage: Not logged in")
+			}
+			if m.filesListContainer != nil {
+				m.filesListContainer.Objects = nil
+				m.filesListContainer.Refresh()
+			}
 		})
+		return
+	}
+	if m.filesListContainer == nil || m.storageUsageLabel == nil {
 		return
 	}
 
@@ -1463,9 +1471,14 @@ func (m *ManagerApp) buildUsersTab() fyne.CanvasObject {
 func (m *ManagerApp) refreshUsersList() {
 	if m.authToken == "" {
 		fyne.Do(func() {
-			m.usersTableContainer.Objects = []fyne.CanvasObject{widget.NewLabel("Please log in as an administrator to view and manage users.")}
-			m.usersTableContainer.Refresh()
+			if m.usersTableContainer != nil {
+				m.usersTableContainer.Objects = []fyne.CanvasObject{widget.NewLabel("Please log in as an administrator to view and manage users.")}
+				m.usersTableContainer.Refresh()
+			}
 		})
+		return
+	}
+	if m.usersTableContainer == nil {
 		return
 	}
 
