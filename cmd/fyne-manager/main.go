@@ -9,7 +9,9 @@ import (
 	_ "image/png"
 	"io"
 	"mime/multipart"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"net/http"
 	"strconv"
 	"strings"
@@ -2046,20 +2048,38 @@ func (m *ManagerApp) buildNASTab() fyne.CanvasObject {
 
 
 func (m *ManagerApp) pushToDisplayNow() {
-	devID := strings.TrimSpace(m.displayDeviceIDEntry.Text)
-	if devID == "" {
-		devID = "reterminal-01"
+	devID := "reterminal-01"
+	if m.displayDeviceIDEntry != nil && strings.TrimSpace(m.displayDeviceIDEntry.Text) != "" {
+		devID = strings.TrimSpace(m.displayDeviceIDEntry.Text)
 	}
-	mac := strings.TrimSpace(m.displayBLEMacEntry.Text)
-	if mac == "" {
-		mac = "AC:27:6E:A6:AA:F5"
+	mac := "AC:27:6E:A6:AA:F5"
+	if m.displayBLEMacEntry != nil && strings.TrimSpace(m.displayBLEMacEntry.Text) != "" {
+		mac = strings.TrimSpace(m.displayBLEMacEntry.Text)
 	}
 
 	progressDialog := dialog.NewInformation("Pushing to reTerminal", "Connecting to reTerminal over BLE and uploading live 800x480 dashboard...\nPlease wait...", m.window)
 	progressDialog.Show()
 
 	go func() {
-		// First try server-side push endpoint
+		// 1. If background daemon is active on this system, restarting it triggers an immediate sync without BLE conflicts
+		isServiceActive := false
+		if out, err := exec.Command("systemctl", "--user", "is-active", "neon-opendisplay.service").Output(); err == nil {
+			if strings.TrimSpace(string(out)) == "active" {
+				isServiceActive = true
+			}
+		}
+
+		if isServiceActive {
+			_ = exec.Command("systemctl", "--user", "restart", "neon-opendisplay.service").Run()
+			time.Sleep(5 * time.Second)
+			fyne.Do(func() {
+				progressDialog.Hide()
+				dialog.ShowInformation("Screen Refreshed!", "🎉 Triggered instant screen sync via the active background service!", m.window)
+			})
+			return
+		}
+
+		// 2. Try server-side push endpoint
 		url := fmt.Sprintf("%s/api/v1/display/%s/push", m.apiBaseURL, devID)
 		req, _ := http.NewRequest("POST", url, nil)
 		if m.authToken != "" {
@@ -2069,14 +2089,31 @@ func (m *ManagerApp) pushToDisplayNow() {
 
 		// If server push failed (e.g. server is out of BLE range), fallback to local python pusher
 		if err != nil || (resp != nil && resp.StatusCode != http.StatusOK) {
+			scriptCandidates := []string{
+				"scripts/opendisplay_pusher.py",
+				filepath.Join(os.Getenv("HOME"), "Projects/NeonServices/scripts/opendisplay_pusher.py"),
+				"/var/home/neonphnx/Projects/NeonServices/scripts/opendisplay_pusher.py",
+				"/usr/local/bin/opendisplay_pusher.py",
+			}
 			script := "scripts/opendisplay_pusher.py"
+			for _, cand := range scriptCandidates {
+				if _, statErr := os.Stat(cand); statErr == nil {
+					script = cand
+					break
+				}
+			}
+
 			targetURL := m.apiBaseURL + "/screen"
 			cmd := exec.Command("python3", script, "--mac", mac, "--url", targetURL, "--once")
 			out, localErr := cmd.CombinedOutput()
 			fyne.Do(func() {
 				progressDialog.Hide()
 				if localErr != nil {
-					dialog.ShowError(fmt.Errorf("Bluetooth Push Failed:\n\n%s\n%v\n\nEnsure py-opendisplay is installed: pip install py-opendisplay pillow requests", string(out), localErr), m.window)
+					errMsg := strings.TrimSpace(string(out))
+					if errMsg == "" {
+						errMsg = localErr.Error()
+					}
+					dialog.ShowError(fmt.Errorf("Bluetooth Push Notice:\n\n%s\n\nTip: If the reTerminal E1001 is asleep, press the green wake button on the device to accept updates.", errMsg), m.window)
 				} else {
 					dialog.ShowInformation("Screen Refreshed!", "🎉 Successfully pushed live dashboard to reTerminal E1001 over Bluetooth!\n\n"+string(out), m.window)
 				}
