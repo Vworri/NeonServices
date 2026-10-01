@@ -35,6 +35,7 @@ type AuditLog struct {
 type DisplayConfig struct {
 	DeviceID              string    `json:"device_id"`
 	UserID                int64     `json:"user_id"`
+	ZipCode               string    `json:"zip_code"`
 	CityName              string    `json:"city_name"`
 	Latitude              float64   `json:"latitude"`
 	Longitude             float64   `json:"longitude"`

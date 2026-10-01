@@ -26,12 +26,14 @@ import (
 	"net/url"
 
 	"github.com/neonphnx/NeonServices/internal/ble"
+	"github.com/neonphnx/NeonServices/internal/display"
 	"github.com/neonphnx/NeonServices/internal/config"
 	"github.com/neonphnx/NeonServices/internal/database"
 	"github.com/neonphnx/NeonServices/internal/sshutil"
 )
 
 type ManagerApp struct {
+	app        fyne.App
 	window     fyne.Window
 	httpClient *http.Client
 	sshClient  *sshutil.Client
@@ -67,6 +69,7 @@ type ManagerApp struct {
 	// User Devices Management (reTerminal E1001)
 	deviceSelect               *widget.Select
 	displayDeviceIDEntry       *widget.Entry
+	displayZipEntry            *widget.Entry
 	displayCityEntry           *widget.Entry
 	displayLatEntry            *widget.Entry
 	displayLonEntry            *widget.Entry
@@ -104,12 +107,24 @@ func main() {
 	w.Resize(fyne.NewSize(1100, 780))
 
 	m := &ManagerApp{
+		app:        a,
 		window:     w,
 		httpClient: &http.Client{Timeout: 15 * time.Second},
-		apiBaseURL: "http://192.168.3.54:8080",
+		apiBaseURL: a.Preferences().StringWithFallback("session_api_url", "http://192.168.3.54:8080"),
 	}
 
-	w.SetContent(m.buildUI())
+	if m.tryRestoreSession() {
+		m.showMainAppUI()
+		m.refreshProfileView()
+		m.refreshDeviceList()
+		m.refreshUserFiles()
+		if m.currentUser != nil && m.currentUser.Role == database.RoleAdmin {
+			m.refreshUsersList()
+		}
+	} else {
+		m.showSplashScreen()
+	}
+
 	w.ShowAndRun()
 }
 
@@ -124,18 +139,127 @@ func showWideDialog(title, confirmText, dismissText string, box fyne.CanvasObjec
 	d.Resize(fyne.NewSize(minW+40, minH+90))
 }
 
-func (m *ManagerApp) buildUI() fyne.CanvasObject {
-	m.userStatusLabel = widget.NewLabel("Status: Logged Out (Public Guest)")
+func (m *ManagerApp) showMainAppUI() {
+	fyne.Do(func() {
+		m.window.SetContent(m.buildMainAppUI())
+	})
+}
+
+func (m *ManagerApp) showSplashScreen() {
+	fyne.Do(func() {
+		m.window.SetContent(m.buildSplashScreen())
+	})
+}
+
+func (m *ManagerApp) buildSplashScreen() fyne.CanvasObject {
+	title := canvas.NewText("⚡ NEON SERVICES", color.NRGBA{R: 0, G: 215, B: 255, A: 255})
+	title.TextSize = 28
+	title.TextStyle = fyne.TextStyle{Bold: true}
+	title.Alignment = fyne.TextAlignCenter
+
+	subtitle := canvas.NewText("Multi-User Cloud NAS & E-Paper Ecosystem", color.NRGBA{R: 160, G: 180, B: 200, A: 255})
+	subtitle.TextSize = 14
+	subtitle.TextStyle = fyne.TextStyle{Italic: true}
+	subtitle.Alignment = fyne.TextAlignCenter
+
+	serverURLEntry := widget.NewEntry()
+	serverURLEntry.SetText(m.apiBaseURL)
+	serverStatusBadge := widget.NewLabel("Checking server status...")
+	serverStatusBadge.Alignment = fyne.TextAlignCenter
+
+	go func() {
+		checkURL := m.apiBaseURL + "/api/v1/display/render"
+		resp, err := m.httpClient.Get(checkURL)
+		fyne.Do(func() {
+			if err == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusBadRequest) {
+				serverStatusBadge.SetText("● Server Online (" + m.apiBaseURL + ")")
+			} else {
+				serverStatusBadge.SetText("○ Server Offline or Unreachable")
+			}
+		})
+	}()
+
+	loginBtn := widget.NewButtonWithIcon("Sign In to Account", theme.LoginIcon(), func() {
+		m.apiBaseURL = strings.TrimRight(serverURLEntry.Text, "/")
+		m.showLoginDialog()
+	})
+	loginBtn.Importance = widget.HighImportance
+
+	quickAdminBtn := widget.NewButtonWithIcon("Quick Sign-In (Admin)", theme.AccountIcon(), func() {
+		m.apiBaseURL = strings.TrimRight(serverURLEntry.Text, "/")
+		m.quickAdminLogin()
+	})
+
+	registerBtn := widget.NewButtonWithIcon("Create New Account", theme.ContentAddIcon(), func() {
+		m.apiBaseURL = strings.TrimRight(serverURLEntry.Text, "/")
+		m.showRegisterDialog()
+	})
+
+	featuresBox := container.NewVBox(
+		widget.NewLabelWithStyle("✨ Unified Ecosystem Features:", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		widget.NewLabel("• StationPC PocketCloud NAS integration with personal cloud quotas"),
+		widget.NewLabel("• Seeed Studio reTerminal E1001 OpenDisplay monochrome dashboard"),
+		widget.NewLabel("• Multi-calendar synchronization (Google, Outlook, Apple iCal feeds)"),
+		widget.NewLabel("• Real-time local weather & air quality by ZIP Code"),
+		widget.NewLabel("• Automatic Bluetooth Low Energy (BLE) background refresh daemon"),
+	)
+
+	cardContent := container.NewVBox(
+		title,
+		subtitle,
+		widget.NewSeparator(),
+		container.NewPadded(serverStatusBadge),
+		widget.NewForm(
+			widget.NewFormItem("Server Address", serverURLEntry),
+		),
+		widget.NewSeparator(),
+		container.NewVBox(
+			loginBtn,
+			quickAdminBtn,
+			registerBtn,
+		),
+		widget.NewSeparator(),
+		featuresBox,
+	)
+
+	card := container.NewStack(
+		canvas.NewRectangle(color.NRGBA{R: 28, G: 32, B: 44, A: 255}),
+		container.NewPadded(container.NewPadded(cardContent)),
+	)
+
+	cardSpacer := canvas.NewRectangle(color.Transparent)
+	cardSpacer.SetMinSize(fyne.NewSize(540, 580))
+
+	return container.NewCenter(container.NewStack(cardSpacer, card))
+}
+
+func (m *ManagerApp) buildMainAppUI() fyne.CanvasObject {
+	userStatus := "Status: Logged Out"
+	if m.currentUser != nil {
+		userStatus = fmt.Sprintf("Logged in: %s (%s)", m.currentUser.Username, strings.ToUpper(string(m.currentUser.Role)))
+	}
+	m.userStatusLabel = widget.NewLabel(userStatus)
+
 	m.loginBtn = widget.NewButtonWithIcon("Log In", theme.LoginIcon(), func() {
 		m.showLoginDialog()
 	})
+	if m.currentUser != nil {
+		m.loginBtn.Hide()
+	}
+
 	m.registerBtn = widget.NewButtonWithIcon("Register", theme.ContentAddIcon(), func() {
 		m.showRegisterDialog()
 	})
+	if m.currentUser != nil {
+		m.registerBtn.Hide()
+	}
+
 	m.logoutBtn = widget.NewButtonWithIcon("Log Out", theme.LogoutIcon(), func() {
 		m.logout()
 	})
-	m.logoutBtn.Hide()
+	if m.currentUser == nil {
+		m.logoutBtn.Hide()
+	}
 
 	brandText := canvas.NewText("⚡ NEON SERVICES", color.NRGBA{R: 0, G: 215, B: 255, A: 255})
 	brandText.TextSize = 16
@@ -163,6 +287,120 @@ func (m *ManagerApp) buildUI() fyne.CanvasObject {
 		nil, nil, nil,
 		m.tabs,
 	)
+}
+
+func (m *ManagerApp) saveSession(token string, user *database.User, apiURL string) {
+	if m.app == nil {
+		return
+	}
+	p := m.app.Preferences()
+	p.SetString("session_token", token)
+	p.SetString("session_api_url", apiURL)
+	if user != nil {
+		p.SetString("session_username", user.Username)
+		p.SetString("session_role", string(user.Role))
+		p.SetInt("session_user_id", int(user.ID))
+	}
+}
+
+func (m *ManagerApp) clearSession() {
+	if m.app == nil {
+		return
+	}
+	p := m.app.Preferences()
+	p.RemoveValue("session_token")
+	p.RemoveValue("session_username")
+	p.RemoveValue("session_role")
+	p.RemoveValue("session_user_id")
+}
+
+func (m *ManagerApp) tryRestoreSession() bool {
+	if m.app == nil {
+		return false
+	}
+	p := m.app.Preferences()
+	token := p.String("session_token")
+	if token == "" {
+		return false
+	}
+	apiURL := p.StringWithFallback("session_api_url", m.apiBaseURL)
+	m.apiBaseURL = apiURL
+
+	req, _ := http.NewRequest("GET", m.apiBaseURL+"/api/v1/user/profile", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := m.httpClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		m.clearSession()
+		return false
+	}
+	defer resp.Body.Close()
+
+	var res struct {
+		Success bool `json:"success"`
+		Data    struct {
+			User *database.User `json:"user"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil || res.Data.User == nil {
+		m.clearSession()
+		return false
+	}
+
+	m.authToken = token
+	m.currentUser = res.Data.User
+	return true
+}
+
+func (m *ManagerApp) onLoginSuccess(token string, user *database.User) {
+	m.authToken = token
+	m.currentUser = user
+
+	m.saveSession(token, user, m.apiBaseURL)
+	m.showMainAppUI()
+
+	m.refreshProfileView()
+	m.refreshDeviceList()
+	m.refreshUserFiles()
+	if m.currentUser.Role == database.RoleAdmin {
+		m.refreshUsersList()
+	}
+
+	dialog.ShowInformation("Welcome", fmt.Sprintf("Successfully logged in as %s (%s)", m.currentUser.Username, m.currentUser.Role), m.window)
+}
+
+func (m *ManagerApp) quickAdminLogin() {
+	go func() {
+		payload := map[string]string{
+			"username": "admin",
+			"password": "AdminPassword123!",
+		}
+		bodyBytes, _ := json.Marshal(payload)
+		resp, err := m.httpClient.Post(m.apiBaseURL+"/api/v1/auth/login", "application/json", bytes.NewReader(bodyBytes))
+		if err != nil {
+			fyne.Do(func() {
+				dialog.ShowError(fmt.Errorf("Failed to connect to %s: %v", m.apiBaseURL, err), m.window)
+			})
+			return
+		}
+		defer resp.Body.Close()
+
+		var authRes struct {
+			Success bool `json:"success"`
+			Data    struct {
+				Token string         `json:"token"`
+				User  *database.User `json:"user"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&authRes); err == nil && authRes.Data.User != nil {
+			fyne.Do(func() {
+				m.onLoginSuccess(authRes.Data.Token, authRes.Data.User)
+			})
+		} else {
+			fyne.Do(func() {
+				dialog.ShowError(fmt.Errorf("Quick login failed: check server"), m.window)
+			})
+		}
+	}()
 }
 
 // ==============================================================================
@@ -236,22 +474,7 @@ func (m *ManagerApp) showLoginDialog() {
 			}
 
 			fyne.Do(func() {
-				m.authToken = authRes.Data.Token
-				m.currentUser = authRes.Data.User
-
-				m.userStatusLabel.SetText(fmt.Sprintf("Logged in: %s (%s)", m.currentUser.Username, strings.ToUpper(string(m.currentUser.Role))))
-				m.loginBtn.Hide()
-				m.registerBtn.Hide()
-				m.logoutBtn.Show()
-
-				m.refreshProfileView()
-				m.refreshDeviceList()
-				m.refreshUserFiles()
-				if m.currentUser.Role == database.RoleAdmin {
-					m.refreshUsersList()
-				}
-
-				dialog.ShowInformation("Welcome", fmt.Sprintf("Successfully logged in as %s (%s)", m.currentUser.Username, m.currentUser.Role), m.window)
+				m.onLoginSuccess(authRes.Data.Token, authRes.Data.User)
 			})
 		}()
 	})
@@ -320,21 +543,7 @@ func (m *ManagerApp) showRegisterDialog() {
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&authRes); err == nil && authRes.Data.User != nil {
 				fyne.Do(func() {
-					m.authToken = authRes.Data.Token
-					m.currentUser = authRes.Data.User
-
-					m.userStatusLabel.SetText(fmt.Sprintf("Logged in: %s (%s)", m.currentUser.Username, strings.ToUpper(string(m.currentUser.Role))))
-					m.loginBtn.Hide()
-					m.registerBtn.Hide()
-					m.logoutBtn.Show()
-
-					m.refreshProfileView()
-					m.refreshDeviceList()
-					m.refreshUserFiles()
-					if m.currentUser.Role == database.RoleAdmin {
-						m.refreshUsersList()
-					}
-					dialog.ShowInformation("Welcome", fmt.Sprintf("Account created successfully for %s!", m.currentUser.Username), m.window)
+					m.onLoginSuccess(authRes.Data.Token, authRes.Data.User)
 				})
 			}
 		}()
@@ -342,22 +551,60 @@ func (m *ManagerApp) showRegisterDialog() {
 }
 
 func (m *ManagerApp) logout() {
+	m.clearSession()
 	m.authToken = ""
 	m.currentUser = nil
-	m.userStatusLabel.SetText("Status: Logged Out (Public Guest)")
-	m.loginBtn.Show()
-	m.registerBtn.Show()
-	m.logoutBtn.Hide()
-	m.profileInfoLabel.SetText("Please log in to view your profile and credentials.")
-	m.apiKeyEntry.SetText("")
-	m.filesListContainer.Objects = nil
-	m.filesListContainer.Refresh()
-	m.storageUsageLabel.SetText("Storage: Not logged in")
+
+	if m.profileInfoLabel != nil {
+		m.profileInfoLabel.SetText("Please log in to view your profile.")
+	}
+	if m.apiKeyEntry != nil {
+		m.apiKeyEntry.SetText("")
+	}
+
+	if m.displayDeviceIDEntry != nil {
+		m.displayDeviceIDEntry.SetText("")
+	}
+	if m.displayZipEntry != nil {
+		m.displayZipEntry.SetText("")
+	}
+	if m.displayCityEntry != nil {
+		m.displayCityEntry.SetText("")
+	}
+	if m.displayLatEntry != nil {
+		m.displayLatEntry.SetText("")
+	}
+	if m.displayLonEntry != nil {
+		m.displayLonEntry.SetText("")
+	}
+	if m.displayTimezoneEntry != nil {
+		m.displayTimezoneEntry.SetText("")
+	}
+	if m.displayCalURLEntry != nil {
+		m.displayCalURLEntry.SetText("")
+	}
+	if m.displayBLEMacEntry != nil {
+		m.displayBLEMacEntry.SetText("")
+	}
+	if m.deviceSelect != nil {
+		m.deviceSelect.Options = []string{"(No Devices)"}
+		m.deviceSelect.Refresh()
+	}
+
+	if m.filesListContainer != nil {
+		m.filesListContainer.Objects = nil
+		m.filesListContainer.Refresh()
+	}
+	if m.storageUsageLabel != nil {
+		m.storageUsageLabel.SetText("Storage: Not logged in")
+	}
 	if m.usersTableContainer != nil {
 		m.usersTableContainer.Objects = nil
 		m.usersTableContainer.Refresh()
 	}
-	dialog.ShowInformation("Logged Out", "You have been logged out successfully.", m.window)
+
+	m.showSplashScreen()
+	dialog.ShowInformation("Logged Out", "You have been logged out and all session data removed from memory.", m.window)
 }
 
 // ==============================================================================
@@ -521,6 +768,14 @@ func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
 	m.displayDeviceIDEntry = widget.NewEntry()
 	m.displayDeviceIDEntry.SetText("reterminal-01")
 
+	m.displayZipEntry = widget.NewEntry()
+	m.displayZipEntry.SetText("10001")
+	m.displayZipEntry.SetPlaceHolder("e.g. 90210, 10001, 30301")
+
+	lookupZipBtn := widget.NewButtonWithIcon("Lookup Zip", theme.SearchIcon(), func() {
+		m.lookupZipCode()
+	})
+
 	m.displayCityEntry = widget.NewEntry()
 	m.displayCityEntry.SetText("New York, NY")
 
@@ -577,7 +832,8 @@ func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
 	newDeviceBtn := widget.NewButtonWithIcon("+ Add Device", theme.ContentAddIcon(), func() {
 		nextID := fmt.Sprintf("reterminal-%02d", len(m.deviceSelect.Options)+1)
 		m.displayDeviceIDEntry.SetText(nextID)
-		m.displayCityEntry.SetText("New York, NY")
+		m.displayZipEntry.SetText("")
+		m.displayCityEntry.SetText("")
 		m.displayCalURLEntry.SetText("")
 		m.displayBLEMacEntry.SetText("")
 		m.displayAutoPushCheck.SetChecked(false)
@@ -614,7 +870,8 @@ func (m *ManagerApp) buildDeviceTab() fyne.CanvasObject {
 
 	form := widget.NewForm(
 		widget.NewFormItem("Device Identifier", m.displayDeviceIDEntry),
-		widget.NewFormItem("City Name", m.displayCityEntry),
+		widget.NewFormItem("ZIP Code (Auto-Locate)", container.NewBorder(nil, nil, nil, lookupZipBtn, m.displayZipEntry)),
+		widget.NewFormItem("City / Region", m.displayCityEntry),
 		widget.NewFormItem("Latitude", m.displayLatEntry),
 		widget.NewFormItem("Longitude", m.displayLonEntry),
 		widget.NewFormItem("Timezone", m.displayTimezoneEntry),
@@ -719,6 +976,9 @@ func (m *ManagerApp) fetchDisplayConfigFor(deviceID string) {
 				m.displayLonEntry.SetText(fmt.Sprintf("%.4f", res.Data.Longitude))
 				m.displayTimezoneEntry.SetText(res.Data.Timezone)
 				m.displayCalURLEntry.SetText(res.Data.CalendarURL)
+				if res.Data.ZipCode != "" {
+					m.displayZipEntry.SetText(res.Data.ZipCode)
+				}
 				m.displayFullRefreshEntry.SetText(fmt.Sprintf("%d", res.Data.FullRefreshMinutes))
 				m.displayPartialRefreshEntry.SetText(fmt.Sprintf("%d", res.Data.PartialRefreshMinutes))
 				if res.Data.BLEMAC != "" {
@@ -749,6 +1009,7 @@ func (m *ManagerApp) saveDisplayDevice() {
 
 	payload := map[string]interface{}{
 		"device_id":               strings.TrimSpace(m.displayDeviceIDEntry.Text),
+		"zip_code":                strings.TrimSpace(m.displayZipEntry.Text),
 		"city_name":               m.displayCityEntry.Text,
 		"latitude":                lat,
 		"longitude":               lon,
@@ -1825,6 +2086,53 @@ func (m *ManagerApp) pushToDisplayNow() {
 				dialog.ShowInformation("Screen Refreshed!", "🎉 Successfully refreshed reTerminal E1001 e-Paper screen!\n\n"+res.Output, m.window)
 			} else {
 				dialog.ShowError(fmt.Errorf("Push Failed: %s\n%s", res.Error, res.Output), m.window)
+			}
+		})
+	}()
+}
+
+
+func (m *ManagerApp) lookupZipCode() {
+	zip := strings.TrimSpace(m.displayZipEntry.Text)
+	if zip == "" {
+		dialog.ShowInformation("ZIP Required", "Please enter a 5-digit ZIP code to lookup weather and timezone.", m.window)
+		return
+	}
+
+	go func() {
+		// First try server API
+		url := fmt.Sprintf("%s/api/v1/geo/zip/%s", m.apiBaseURL, zip)
+		req, _ := http.NewRequest("GET", url, nil)
+		resp, err := m.httpClient.Do(req)
+
+		var loc *display.ZipLocation
+		if err == nil && resp.StatusCode == http.StatusOK {
+			defer resp.Body.Close()
+			var res struct {
+				Success bool                 `json:"success"`
+				Data    *display.ZipLocation `json:"data"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&res); err == nil && res.Data != nil {
+				loc = res.Data
+			}
+		}
+
+		// Fallback to local package lookup
+		if loc == nil {
+			if l, err := display.LookupZipCode(zip); err == nil {
+				loc = l
+			}
+		}
+
+		fyne.Do(func() {
+			if loc != nil {
+				m.displayCityEntry.SetText(loc.CityName)
+				m.displayLatEntry.SetText(fmt.Sprintf("%.4f", loc.Latitude))
+				m.displayLonEntry.SetText(fmt.Sprintf("%.4f", loc.Longitude))
+				m.displayTimezoneEntry.SetText(loc.Timezone)
+				dialog.ShowInformation("ZIP Code Resolved", fmt.Sprintf("ZIP %s resolved to:\n\n📍 Location: %s\n🌐 Lat/Lon: %.4f, %.4f\n⏰ Timezone: %s", zip, loc.CityName, loc.Latitude, loc.Longitude, loc.Timezone), m.window)
+			} else {
+				dialog.ShowError(fmt.Errorf("Could not resolve ZIP code %q. Please verify or enter location manually.", zip), m.window)
 			}
 		})
 	}()

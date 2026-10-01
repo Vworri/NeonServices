@@ -113,6 +113,7 @@ func (s *Service) GetData(deviceID string) (*DisplayData, error) {
 		TimeStr:         now.Format("03:04 PM"),
 		DateStr:         now.Format("January 02, 2006"),
 		DayOfWeek:       strings.ToUpper(now.Format("Monday")),
+		ZipCode:         cfg.ZipCode,
 		CityName:        cfg.CityName,
 		Weather:         weather,
 		AirQuality:      aqi,
@@ -153,6 +154,9 @@ func (s *Service) RegisterRoutes(mux *http.ServeMux) {
 	// 5. OpenDisplay Direct Push (BLE/LAN)
 	mux.HandleFunc("POST /api/v1/display/{device_id}/push", s.handlePush)
 	mux.HandleFunc("GET /api/v1/display/{device_id}/push", s.handlePush)
+
+	// 6. Zip Code Geocoding & Timezone Lookup
+	mux.HandleFunc("GET /api/v1/geo/zip/{zip}", s.handleZipLookup)
 }
 
 func (s *Service) handleRenderPNG(w http.ResponseWriter, r *http.Request) {
@@ -264,6 +268,17 @@ func (s *Service) handleSaveConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.ZipCode != "" && (req.Latitude == 0 && req.Longitude == 0 || req.CityName == "") {
+		if loc, err := LookupZipCode(req.ZipCode); err == nil && loc != nil {
+			if req.CityName == "" {
+				req.CityName = loc.CityName
+			}
+			req.Latitude = loc.Latitude
+			req.Longitude = loc.Longitude
+			req.Timezone = loc.Timezone
+		}
+	}
+
 	if req.FullRefreshMinutes <= 0 {
 		req.FullRefreshMinutes = 30
 	}
@@ -277,6 +292,7 @@ func (s *Service) handleSaveConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := &database.DisplayConfig{
 		DeviceID:              deviceID,
 		UserID:                req.UserID,
+		ZipCode:               req.ZipCode,
 		CityName:              req.CityName,
 		Latitude:              req.Latitude,
 		Longitude:             req.Longitude,
@@ -498,4 +514,19 @@ func (s *Service) StartAutoPusher(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+
+func (s *Service) handleZipLookup(w http.ResponseWriter, r *http.Request) {
+	zip := r.PathValue("zip")
+	loc, err := LookupZipCode(zip)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"data":    loc,
+	})
 }

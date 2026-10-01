@@ -37,6 +37,7 @@ type DisplayData struct {
 	TimeStr         string         `json:"time_str"`
 	DateStr         string         `json:"date_str"`
 	DayOfWeek       string         `json:"day_of_week"`
+	ZipCode         string         `json:"zip_code,omitempty"`
 	CityName        string         `json:"city_name"`
 	Weather         WeatherInfo    `json:"weather"`
 	AirQuality      AirQualityInfo `json:"air_quality"`
@@ -48,6 +49,7 @@ type DisplayData struct {
 
 type ConfigRequest struct {
 	UserID                int64   `json:"user_id"`
+	ZipCode               string  `json:"zip_code"`
 	CityName              string  `json:"city_name"`
 	Latitude              float64 `json:"latitude"`
 	Longitude             float64 `json:"longitude"`
@@ -64,7 +66,8 @@ func DefaultConfig(deviceID string, userID int64) *database.DisplayConfig {
 	return &database.DisplayConfig{
 		DeviceID:              deviceID,
 		UserID:                userID,
-		CityName:              "New York",
+		ZipCode:               "10001",
+		CityName:              "New York, NY",
 		Latitude:              40.7128,
 		Longitude:             -74.0060,
 		Timezone:              "Local",

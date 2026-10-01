@@ -133,6 +133,7 @@ func (h *UserHandler) ListDevices(w http.ResponseWriter, r *http.Request) {
 
 type SaveDeviceRequest struct {
 	DeviceID              string  `json:"device_id"`
+	ZipCode               string  `json:"zip_code"`
 	CityName              string  `json:"city_name"`
 	Latitude              float64 `json:"latitude"`
 	Longitude             float64 `json:"longitude"`
@@ -179,6 +180,7 @@ func (h *UserHandler) SaveDevice(w http.ResponseWriter, r *http.Request) {
 	cfg := &database.DisplayConfig{
 		DeviceID:              strings.TrimSpace(req.DeviceID),
 		UserID:                claims.UserID,
+		ZipCode:               req.ZipCode,
 		CityName:              req.CityName,
 		Latitude:              req.Latitude,
 		Longitude:             req.Longitude,
