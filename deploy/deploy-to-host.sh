@@ -364,17 +364,21 @@ CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -ldflags="-s -w" -o "bin/neon
 echo "[+] Built: bin/api-server-linux-$GOARCH and bin/neon-ctl-linux-$GOARCH"
 
 # 5. Prepare Remote Installation Directory and Transfer Files
-echo "[5/7] Deploying binaries to $REMOTE_HOST:$REMOTE_INSTALL_DIR..."
-run_ssh_interactive "sudo mkdir -p $REMOTE_INSTALL_DIR /var/lib/neonservices $NAS_MOUNT_POINT/storage && \
+echo "[5/7] Deploying binaries and companion services to $REMOTE_HOST:$REMOTE_INSTALL_DIR..."
+run_ssh_interactive "sudo mkdir -p $REMOTE_INSTALL_DIR/python $REMOTE_INSTALL_DIR/scripts $REMOTE_INSTALL_DIR/deploy /var/lib/neonservices $NAS_MOUNT_POINT/storage && \
                      sudo chown -R $SSH_USER:$SSH_USER $REMOTE_INSTALL_DIR && \
                      sudo chown -R neon:neon $NAS_MOUNT_POINT"
 
 run_scp "bin/api-server-linux-$GOARCH" "$SSH_USER@$REMOTE_HOST:$REMOTE_INSTALL_DIR/api-server.new"
 run_scp "bin/neon-ctl-linux-$GOARCH" "$SSH_USER@$REMOTE_HOST:$REMOTE_INSTALL_DIR/neon-ctl.new"
+run_scp -r "python" "$SSH_USER@$REMOTE_HOST:$REMOTE_INSTALL_DIR/"
+run_scp -r "scripts" "$SSH_USER@$REMOTE_HOST:$REMOTE_INSTALL_DIR/"
+run_scp -r "deploy" "$SSH_USER@$REMOTE_HOST:$REMOTE_INSTALL_DIR/"
 
 run_ssh_interactive "chmod +x $REMOTE_INSTALL_DIR/api-server.new $REMOTE_INSTALL_DIR/neon-ctl.new && \
          mv $REMOTE_INSTALL_DIR/api-server.new $REMOTE_INSTALL_DIR/api-server && \
          mv $REMOTE_INSTALL_DIR/neon-ctl.new $REMOTE_INSTALL_DIR/neon-ctl && \
+         chmod -R +x $REMOTE_INSTALL_DIR/scripts $REMOTE_INSTALL_DIR/python 2>/dev/null || true && \
          sudo ln -sf $REMOTE_INSTALL_DIR/neon-ctl /usr/local/bin/neon-ctl || true"
 
 # 6. Setup Configuration and Secrets on Remote
@@ -428,13 +432,14 @@ REMOTE_CONF_EOF
 
 run_remote_script "$STEP6_SCRIPT"
 
-# 7. Install Systemd Service and Restart
-echo "[7/7] Installing systemd unit and starting NeonServices..."
-run_scp "deploy/systemd/neonservices.service" "$SSH_USER@$REMOTE_HOST:/tmp/neonservices.service"
+# 7. Install Systemd Services and Enable Persistent Auto-Start
+echo "[7/7] Installing systemd units and configuring auto-start (survives logout)..."
+run_scp -r "deploy/systemd" "$SSH_USER@$REMOTE_HOST:/tmp/neon-systemd"
 
-run_ssh_interactive "sudo cp /tmp/neonservices.service /etc/systemd/system/neonservices.service && \
+run_ssh_interactive "sudo cp /tmp/neon-systemd/*.service /etc/systemd/system/ && \
          sudo systemctl daemon-reload && \
-         sudo systemctl enable neonservices && \
+         sudo loginctl enable-linger $SSH_USER neon 2>/dev/null || true && \
+         sudo systemctl enable neonservices.service neon-nas-worker.service 2>/dev/null || true && \
          sudo systemctl restart neonservices"
 
 # Health Check Verification

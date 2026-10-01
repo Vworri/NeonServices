@@ -1,0 +1,20 @@
+[Unit]
+Description=NeonServices Python NAS Storage Worker
+After=network.target neonservices.service
+Wants=neonservices.service
+
+[Service]
+Type=simple
+User=neon
+Group=neon
+WorkingDirectory=/opt/neonservices/python
+ExecStart=/usr/bin/python3 -u /opt/neonservices/python/nas_worker.py
+Restart=always
+RestartSec=5s
+
+# Environment
+Environment=NEON_API_URL=http://127.0.0.1:8080
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

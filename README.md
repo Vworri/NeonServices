@@ -140,6 +140,27 @@ To deploy to your Ubuntu machine and ensure the StationPC PocketCloud NAS is mou
 
 ---
 
+## 🔄 Persistent Auto-Start on Ubuntu (Survives Logout & Reboots)
+
+To guarantee that all services from this repository auto-start on system boot and keep running 24/7 even after you log out of the Ubuntu machine or disconnect SSH:
+
+### 1. One-Step Auto-Start Configurator
+Run this on your Ubuntu machine (or run via SSH):
+```bash
+sudo ./deploy/enable-autostart.sh
+```
+
+### 2. What This Configures:
+- **System-Level Systemd Units (`/etc/systemd/system/`)**:
+  - `neonservices.service` (Go Backend API & StationPC PocketCloud NAS Gateway)
+  - `neon-nas-worker.service` (Python Companion NAS Worker)
+  - `neon-opendisplay.service` (OpenDisplay E-Paper Screen BLE Sync Daemon)
+- **Multi-User Boot Targets**: All units are enabled via `systemctl enable <service>` under `multi-user.target`, starting automatically on machine power-on before any user logs in.
+- **User Session Lingering**: Activates `loginctl enable-linger ubuntu neon` so that any user-level background processes or systemd user services are **never killed** when an SSH session disconnects or a user logs out.
+- **Auto-Restart on Failure**: Every service is configured with `Restart=always` and `RestartSec=5s`.
+
+---
+
 ## 🖥️ Fyne Desktop Management App
 
 To run the desktop GUI Control Center:

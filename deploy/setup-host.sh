@@ -17,7 +17,7 @@ INSTALL_DIR="/opt/neonservices"
 DATA_DIR="/var/lib/neonservices"
 NAS_MOUNT_DIR="/mnt/pocketcloud/storage"
 
-echo "[1/5] Creating service user '$SERVICE_USER'..."
+echo "[1/6] Creating service user '$SERVICE_USER'..."
 if ! id "$SERVICE_USER" &>/dev/null; then
   useradd -r -s /bin/false -d "$DATA_DIR" "$SERVICE_USER"
   echo "[+] Service user '$SERVICE_USER' created."
@@ -25,12 +25,28 @@ else
   echo "[i] User '$SERVICE_USER' already exists."
 fi
 
-echo "[2/5] Creating directories..."
-mkdir -p "$INSTALL_DIR"
+# Add neon to bluetooth & dialout groups if available
+for grp in bluetooth dialout; do
+  if getent group "$grp" &>/dev/null; then
+    usermod -a -G "$grp" "$SERVICE_USER" || true
+  fi
+done
+
+echo "[2/6] Enabling persistent lingering (services run even when logged out)..."
+for u in "ubuntu" "$SERVICE_USER" "${SUDO_USER:-}"; do
+  if [ -n "$u" ] && id "$u" &>/dev/null; then
+    loginctl enable-linger "$u"
+    echo "  [+] Enabled linger for $u"
+  fi
+done
+
+echo "[3/6] Creating directories..."
+mkdir -p "$INSTALL_DIR/python"
+mkdir -p "$INSTALL_DIR/scripts"
 mkdir -p "$DATA_DIR"
 mkdir -p "$NAS_MOUNT_DIR"
 
-echo "[3/5] Setting file permissions..."
+echo "[4/6] Setting file permissions..."
 chown -R "$SERVICE_USER:$SERVICE_GROUP" "$INSTALL_DIR"
 chown -R "$SERVICE_USER:$SERVICE_GROUP" "$DATA_DIR"
 chmod 750 "$DATA_DIR"
@@ -41,17 +57,26 @@ if [ -d "$NAS_MOUNT_DIR" ]; then
   chmod -R 775 "$NAS_MOUNT_DIR" || true
 fi
 
-echo "[4/5] Installing systemd unit..."
+echo "[5/6] Installing and enabling all systemd units..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "$SCRIPT_DIR/systemd/neonservices.service" ]; then
-  cp "$SCRIPT_DIR/systemd/neonservices.service" /etc/systemd/system/neonservices.service
+SYSTEMD_SRC="$SCRIPT_DIR/systemd"
+
+if [ -d "$SYSTEMD_SRC" ]; then
+  for svc in "$SYSTEMD_SRC"/*.service; do
+    if [ -f "$svc" ]; then
+      svc_name=$(basename "$svc")
+      cp "$svc" "/etc/systemd/system/$svc_name"
+      systemctl enable "$svc_name"
+      echo "  [+] Installed and enabled /etc/systemd/system/$svc_name"
+    fi
+  done
   systemctl daemon-reload
-  echo "[+] Systemd service installed at /etc/systemd/system/neonservices.service"
 fi
 
-echo "[5/5] Setup complete!"
+echo "[6/6] Setup complete!"
+echo "All NeonServices will auto-start at boot and persist across logouts."
 echo "Next steps:"
-echo " 1. Ensure StationPC PocketCloud NAS is mounted at $NAS_MOUNT_DIR (or edit /opt/neonservices/config.yaml)"
-echo " 2. Deploy binary and config using 'make deploy' or deploy/deploy.sh"
-echo " 3. Start service: sudo systemctl start neonservices"
+echo " 1. Ensure StationPC PocketCloud NAS is mounted at $NAS_MOUNT_DIR"
+echo " 2. Deploy binary and companion scripts via deploy/deploy-to-host.sh"
+echo " 3. Start services: sudo systemctl start neonservices"
 echo "=========================================="
